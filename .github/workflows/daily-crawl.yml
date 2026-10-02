@@ -3,7 +3,7 @@ name: 每日药材价格抓取
 on:
   # 定时：UTC 00:17 = 北京时间 08:17（避开整点，GitHub 整点容易排队）
   schedule:
-    - cron: '43 11 * * *'
+    - cron: '17 0 * * *'
   # 允许在 GitHub 网页上手动点一下就跑，方便随时测试
   workflow_dispatch:
 
