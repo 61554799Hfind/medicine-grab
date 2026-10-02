@@ -8,8 +8,9 @@ sa_b64.txt          # 密钥的 base64 中转文件，用完即删
 edge_profile/
 browser_profile/
 
-# 调试/临时产物（含测试用的浏览器 profile，约 55MB，可随时手动删除）
+# 调试/临时产物
 _debug/
+_待删除/      # 已清理出的文件暂存处，确认无误后可整个删除
 
 # 运行产物（CI 每次会重新生成，不必进仓库）
 crawl.log
