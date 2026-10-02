@@ -1,0 +1,64 @@
+name: 每日药材价格抓取
+
+on:
+  # 定时：UTC 00:17 = 北京时间 08:17（避开整点，GitHub 整点容易排队）
+  schedule:
+    - cron: '17 0 * * *'
+  # 允许在 GitHub 网页上手动点一下就跑，方便随时测试
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90      # 正常约 16~20 分钟，留足余量
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: 还原 Google 服务账号密钥
+        env:
+          GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
+        run: |
+          if [ -z "$GSHEET_SA_B64" ]; then
+            echo "::error::未配置 GSHEET_SA_B64 密钥，无法推送 Google Sheet"
+            exit 1
+          fi
+          echo "$GSHEET_SA_B64" | base64 -d > service_account.json
+
+      - name: 抓取数据并推送
+        env:
+          SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
+          TZ: Asia/Shanghai
+        run: python fast_crawl.py --alias
+
+      - name: 结果自检
+        run: |
+          lines=$(wc -l < 药材涨落对比结果.csv)
+          echo "CSV 行数（含表头）：$lines"
+          if [ "$lines" -lt 100 ]; then
+            echo "::error::结果异常少（$lines 行），大概率被站点拦截了"
+            exit 1
+          fi
+
+      - name: 保存结果文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 药材数据-${{ github.run_number }}
+          retention-days: 30
+          path: |
+            药材涨落对比结果.csv
+            crawl.log
+            failed_medicines.txt
