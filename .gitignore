@@ -2,6 +2,7 @@
 service_account.json
 tencent_auth.json
 auth_state.json
+sa_b64.txt          # 密钥的 base64 中转文件，用完即删
 
 # 浏览器配置（体积大且含个人数据）
 edge_profile/
