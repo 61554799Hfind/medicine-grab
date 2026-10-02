@@ -1,16 +1,8 @@
 # 敏感文件：绝不能提交到 Git 仓库
 service_account.json
-tencent_auth.json
-auth_state.json
-sa_b64.txt          # 密钥的 base64 中转文件，用完即删
 
 # 浏览器配置（体积大且含个人数据）
-edge_profile/
 browser_profile/
-
-# 调试/临时产物
-_debug/
-_待删除/      # 已清理出的文件暂存处，确认无误后可整个删除
 
 # 运行产物（CI 每次会重新生成，不必进仓库）
 crawl.log
