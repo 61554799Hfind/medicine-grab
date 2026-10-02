@@ -69,6 +69,10 @@ SERVER_PROFILE = os.environ.get("BROWSER_PROFILE",
                                 os.path.join(BASE_DIR, "browser_profile"))
 CDP_PORT = 9222
 
+# 本机推送 Google Sheet 时的代理（国内直连 Google 不通）。
+# 只作为「直连失败后的回退」使用；境外服务器永远用不到它。
+LOCAL_PROXY = os.environ.get("LOCAL_PROXY", "http://127.0.0.1:3213")
+
 # ⚠️ WAF 通行证：站点只检查这个 cookie 是否存在且非空，值可以随便填。
 #    实测（2026-10-02）：注入任意 8 位随机字符串即可放行；空字符串会被拦。
 PASS_COOKIE_NAME = "zshcookiename"
@@ -351,21 +355,37 @@ def save_csv(path, header, rows):
         w.writerows(rows)
 
 
-def push_gsheet(header, rows, failed, proxy_url=None):
-    if proxy_url:
-        os.environ["HTTP_PROXY"] = proxy_url
-        os.environ["HTTPS_PROXY"] = proxy_url
-    try:
-        from push_to_gsheet import push_data
-        status = "正常" if not failed else f"部分失败({len(failed)}个)"
-        push_data(header, rows, failed_list=failed, status_msg=status)
-        return True
-    except Exception as e:
-        print(f"⚠️ 推送 Google Sheet 失败：{e}")
-        return False
-    finally:
-        os.environ.pop("HTTP_PROXY", None)
-        os.environ.pop("HTTPS_PROXY", None)
+def push_gsheet(header, rows, failed, proxy_candidates=None):
+    """按候选顺序尝试推送。
+
+    proxy_candidates 是「代理方案」列表，元素为 URL 字符串或 None（None = 直连）。
+    境外服务器（GitHub Actions）直连即可；本机在国内需要走代理。
+    逐个尝试，任一成功就返回，全失败才返回 False。
+    """
+    if proxy_candidates is None:
+        proxy_candidates = [None]
+    last_err = ""
+    for proxy_url in proxy_candidates:
+        if proxy_url:
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            tag = f"（走代理 {proxy_url}）"
+        else:
+            tag = "（直连）"
+        try:
+            from push_to_gsheet import push_data
+            status = "正常" if not failed else f"部分失败({len(failed)}个)"
+            push_data(header, rows, failed_list=failed, status_msg=status)
+            print(f"Google Sheet 推送成功{tag}")
+            return True
+        except Exception as e:
+            last_err = str(e)
+            print(f"⚠️ 推送失败{tag}：{str(e)[:120]}")
+        finally:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("HTTPS_PROXY", None)
+    print(f"⚠️ 所有推送方式均失败，最后一次错误：{last_err[:160]}")
+    return False
 
 
 def main():
@@ -478,9 +498,15 @@ def main():
     if trial:
         c.log("（试跑模式：正式 CSV 与 Google Sheet 均未改动）")
     elif not args.no_push:
-        # 代理只在需要时才用：本机走 127.0.0.1:3213，境外服务器留空直连
-        proxy = os.environ.get("GSHEET_PROXY", "http://127.0.0.1:3213")
-        ok = push_gsheet(HEADER, final_rows, failed, proxy_url=proxy)
+        # 代理策略：
+        #   1) 显式设了 GSHEET_PROXY 就以它为准（填 "none" 表示强制直连）
+        #   2) 没设 → 先直连（境外服务器/CI 走这条），失败再退到本机代理
+        env_proxy = os.environ.get("GSHEET_PROXY", "").strip()
+        if env_proxy:
+            cands = [None] if env_proxy.lower() == "none" else [env_proxy]
+        else:
+            cands = [None, LOCAL_PROXY]
+        ok = push_gsheet(HEADER, final_rows, failed, proxy_candidates=cands)
         c.log("Google Sheet 推送" + ("成功" if ok else "失败（本地 CSV 仍在）"))
     c.close_log()
 

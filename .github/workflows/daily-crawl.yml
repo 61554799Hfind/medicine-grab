@@ -37,6 +37,25 @@ jobs:
           fi
           echo "$GSHEET_SA_B64" | base64 -d > service_account.json
 
+      # 先花几秒确认密钥、表格共享、网络都正常，避免跑完 16 分钟才发现推不上去
+      - name: Google Sheet 连通性自检
+        env:
+          SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
+        run: |
+          python - <<'PYEOF'
+          import os, socket, gspread
+          from google.oauth2.service_account import Credentials
+          socket.setdefaulttimeout(30)
+          scopes = ["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"]
+          creds = Credentials.from_service_account_file(
+              os.environ["SERVICE_ACCOUNT_FILE"], scopes=scopes)
+          sh = gspread.authorize(creds).open_by_key(
+              "1fpy0IiZM-RaXI_XB4VBQvvuD_Wrr6tVm6GrS2uNmSRU")
+          print("已连上表格:", sh.title)
+          print("服务账号:", creds.service_account_email)
+          PYEOF
+
       - name: 抓取数据并推送
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
@@ -49,6 +68,18 @@ jobs:
           echo "CSV 行数（含表头）：$lines"
           if [ "$lines" -lt 100 ]; then
             echo "::error::结果异常少（$lines 行），大概率被站点拦截了"
+            exit 1
+          fi
+
+      # 推送失败时脚本只打日志、不会让任务失败，这里显式校验，
+      # 否则表格一直不更新你也不会收到任何通知。
+      - name: 校验 Google Sheet 推送结果
+        run: |
+          if grep -q "推送成功" crawl.log; then
+            echo "Google Sheet 推送成功"
+          else
+            echo "::error::Google Sheet 推送失败，请看下方日志尾部"
+            tail -n 20 crawl.log
             exit 1
           fi
 
