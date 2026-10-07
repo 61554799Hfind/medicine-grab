@@ -85,17 +85,18 @@ jobs:
         run: python history_crawl.py --incremental
 
       # 「分卷」模式：每卷一张表、每卷 50 个药材，每块 = 官网样式大折线图 + 年×月表。
-      # 药材 → 约 20 张卷表（Google 单工作簿上限 200 张），
+      # 药材 → 约 32 张卷表（Google 单工作簿上限 200 张），
       # 逐日原始数据集中放 daily_pool（自动隐藏），卷表只放区块，图表跨表引用。
       # 链接 = #gid=<卷表>&range=A<块首行>，跳过去并滚到该药材那一块。
       # 每次运行先删旧的「历史图*」+ 池表 + history_daily/history_index/history_monthly 再重建，
       # 所以是覆盖式更新，不会残留昨天的图。
+      # --jobs 6：并发建卷。建图是纯网络等待，1591 个图串行要十几分钟，并发能快好几倍。
       - name: 建药材历史价格大图（分卷，覆盖更新）
         if: steps.sa.outputs.ok == 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
           TZ: Asia/Shanghai
-        run: python build_herb_sheets.py --per-sheet 50 --drop-monthly
+        run: python build_herb_sheets.py --per-sheet 50 --drop-monthly --jobs 6
 
       - name: 结果自检
         run: |

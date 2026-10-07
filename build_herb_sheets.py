@@ -28,9 +28,12 @@ r"""
     .venv\Scripts\python.exe build_herb_sheets.py --per-sheet 50 --drop-monthly   # 全量（926 个）
 """
 import argparse
+import concurrent.futures as cf
 import json
 import math
 import os
+import threading
+import time
 from collections import defaultdict
 
 import gspread
@@ -49,11 +52,26 @@ except Exception:
 
 
 def _update_range(ws, a1, values, vio="RAW"):
-    """兼容 gspread 5.x / 6.x 的写入写法"""
+    """兼容 gspread 5.x / 6.x 的写入写法。ws 是 Worksheet 对象。"""
     if GSPREAD_V6:
         ws.update(values, a1, value_input_option=vio)
     else:
         ws.update(a1, values, value_input_option=vio)
+
+
+def ws_write_values(client, sheet_id, a1, values, vio="RAW"):
+    """用**原始 client** 写某个范围的单元格（多线程安全）。
+
+    并发建卷时不用 Worksheet 对象（它内部有共享状态），直接打 REST 接口。
+    a1 必须自带表名，例如 "'历史图1'!A1"。
+    签名：HTTPClient.values_update(id, range, params=..., body=...)
+    """
+    client.values_update(
+        sheet_id,
+        a1,
+        params={"valueInputOption": vio},
+        body={"values": values},
+    )
 
 
 MONTH_HEADERS = [f"{m}月" for m in range(1, 13)]
@@ -68,6 +86,7 @@ POOL_NAME = "daily_pool"     # 逐日原始数据池（默认隐藏）
 MAX_POOL_ROWS = 500_000      # 单张池表最多行数（超限自动拆成 daily_pool_2 ...）
 POOL_CHUNK = 25_000          # 每次 API 写入的行数
 CHART_BATCH = 25             # 每批 addChart 请求数
+MAX_WORKERS = 4              # 并发建卷的线程数（建图是纯网络等待，并发能快好几倍）
 MAX_SHEETS = 200
 CELL_LIMIT = 10_000_000
 
@@ -217,6 +236,81 @@ def plan_volume(part, raw, pool_off, pool_ids):
     return block_area, specs
 
 
+def build_chart_req(s, sid):
+    """单个药材：标题 + 大折线图 的 addChart 请求体"""
+    return {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": s["title"],
+                    # ⚠️ hiddenDimensionStrategy 是 ChartSpec 的字段，不是 basicChart 的。
+                    # 放错层级会直接 400：Unknown name "hiddenDimensionStrategy" at ...basic_chart
+                    # 作用：数据源表 daily_pool 是隐藏的，显式声明不跳过隐藏行列，避免图变空。
+                    "hiddenDimensionStrategy": "SHOW_ALL",
+                    "basicChart": {
+                        "chartType": "LINE",
+                        "legendPosition": "NO_LEGEND",
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": "日期"},
+                            {"position": "LEFT_AXIS", "title": "价格(元/kg)"},
+                        ],
+                        "domains": [{
+                            "domain": {"sourceRange": {"sources": [{
+                                "sheetId": s["pool_id"],
+                                "startRowIndex": s["p0"], "endRowIndex": s["p1"],
+                                "startColumnIndex": 0, "endColumnIndex": 1,
+                            }]}}
+                        }],
+                        "series": [{
+                            "series": {"sourceRange": {"sources": [{
+                                "sheetId": s["pool_id"],
+                                "startRowIndex": s["p0"], "endRowIndex": s["p1"],
+                                "startColumnIndex": 1, "endColumnIndex": 2,
+                            }]}},
+                            "targetAxis": "LEFT_AXIS",
+                        }],
+                        "headerCount": 1,
+                    },
+                },
+                "position": {"overlayPosition": {
+                    "anchorCell": {"sheetId": sid, "rowIndex": s["anchor_row"],
+                                   "columnIndex": 0},
+                    "widthPixels": CHART_W, "heightPixels": CHART_H,
+                }},
+            }
+        }
+    }
+
+
+def build_one_volume(client, sheet_id, v, part, raw, pool_off, pool_ids, n_vol,
+                     lock, combo_gid, stats):
+    """建一整卷（1 张表 + N 个图表）。多卷并发调用，全程走原始 client（线程安全），不用共享的 sh 对象。"""
+    title = f"{VOL_PREFIX}{v + 1}" if n_vol > 1 else VOL_PREFIX
+    t0 = time.time()
+
+    # 1) 建表（卷表已经由 cleanup_old 删干净了，直接新建；建表请求会顺手返回新表的 sheetId）
+    res = client.batch_update(sheet_id, {"requests": [{"addSheet": {
+        "properties": {"title": title,
+                       "gridProperties": {"rowCount": 20, "columnCount": VOL_COLS}},
+    }}]})
+    sid = res["replies"][0]["addSheet"]["properties"]["sheetId"]
+
+    # 2) 写区块内容（A1 自带表名，走 sheet_id，线程安全）
+    block_area, specs = plan_volume(part, raw, pool_off, pool_ids)
+    ws_write_values(client, sheet_id, f"'{title}'!A1", block_area, "RAW")
+
+    # 3) 批量建图（分批提交，避免单批过大）
+    reqs = [build_chart_req(s, sid) for s in specs]
+    for i in range(0, len(reqs), CHART_BATCH):
+        client.batch_update(sheet_id, {"requests": reqs[i:i + CHART_BATCH]})
+
+    with lock:
+        for s in specs:
+            combo_gid[s["key"]] = (sid, s["block_start"] + 1)
+        stats["charts"] += len(reqs)
+    print(f"  ✅ {title}：{len(part)} 个药材 / {len(reqs)} 个大图 / {time.time() - t0:.0f}s")
+
+
 def create_volumes(sh, combos, raw, per_sheet, drop_monthly=False, hide_pool=True):
     cleanup_old(sh, drop_monthly)
 
@@ -229,68 +323,26 @@ def create_volumes(sh, combos, raw, per_sheet, drop_monthly=False, hide_pool=Tru
             f"需要 {n_vol} 张卷表 + {len(pool_ids)} 张池表，接近/超过 Google 上限 {MAX_SHEETS}，"
             f"请调大 --per-sheet")
 
-    combo_gid = {}
-    vol_cells = 0
-    for v in range(n_vol):
-        part = combos[v * per_sheet:(v + 1) * per_sheet]
-        title = f"{VOL_PREFIX}{v + 1}" if n_vol > 1 else VOL_PREFIX
+    plan = [(v, combos[v * per_sheet:(v + 1) * per_sheet]) for v in range(n_vol)]
+    print(f"  开始建 {n_vol} 张卷表（{MAX_WORKERS} 路并发，每卷先删后建，覆盖旧图）...")
+    combo_gid, stats = {}, {"charts": 0}
+    lock = threading.Lock()
 
-        block_area, specs = plan_volume(part, raw, pool_off, pool_ids)
-        n_rows = len(block_area) + 5
-        ws = sh.add_worksheet(title=title, rows=n_rows, cols=VOL_COLS)
-        sid = ws.id
-        vol_cells += n_rows * VOL_COLS
-        _update_range(ws, "A1", block_area, "RAW")
-
-        reqs = []
-        for s in specs:
-            combo_gid[s["key"]] = (sid, s["block_start"] + 1)
-            reqs.append({
-                "addChart": {
-                    "chart": {
-                        "spec": {
-                            "title": s["title"],
-                            # ⚠️ hiddenDimensionStrategy 是 ChartSpec 的字段，不是 basicChart 的。
-                            # 放错层级会直接 400：Unknown name "hiddenDimensionStrategy" at ...basic_chart
-                            # 作用：数据源表 daily_pool 是隐藏的，显式声明不跳过隐藏行列，避免图变空。
-                            "hiddenDimensionStrategy": "SHOW_ALL",
-                            "basicChart": {
-                                "chartType": "LINE",
-                                "legendPosition": "NO_LEGEND",
-                                "axis": [
-                                    {"position": "BOTTOM_AXIS", "title": "日期"},
-                                    {"position": "LEFT_AXIS", "title": "价格(元/kg)"},
-                                ],
-                                "domains": [{
-                                    "domain": {"sourceRange": {"sources": [{
-                                        "sheetId": s["pool_id"],
-                                        "startRowIndex": s["p0"], "endRowIndex": s["p1"],
-                                        "startColumnIndex": 0, "endColumnIndex": 1,
-                                    }]}}
-                                }],
-                                "series": [{
-                                    "series": {"sourceRange": {"sources": [{
-                                        "sheetId": s["pool_id"],
-                                        "startRowIndex": s["p0"], "endRowIndex": s["p1"],
-                                        "startColumnIndex": 1, "endColumnIndex": 2,
-                                    }]}},
-                                    "targetAxis": "LEFT_AXIS",
-                                }],
-                                "headerCount": 1,
-                            },
-                        },
-                        "position": {"overlayPosition": {
-                            "anchorCell": {"sheetId": sid, "rowIndex": s["anchor_row"],
-                                           "columnIndex": 0},
-                            "widthPixels": CHART_W, "heightPixels": CHART_H,
-                        }},
-                    }
-                }
-            })
-
-        for i in range(0, len(reqs), CHART_BATCH):
-            sh.batch_update({"requests": reqs[i:i + CHART_BATCH]})
-        print(f"  ✅ {title}：{len(part)} 个药材 / {len(reqs)} 个大图 / {n_rows} 行")
+    # 建图是纯网络等待（一个请求约 1 秒），串行跑 1500+ 个要十几分钟；
+    # 用线程池并发提交能快好几倍。gspread 的 http 会话（requests.Session）是线程安全的，
+    # 所以直接复用同一个 client，只避开 Worksheet 对象（它有共享的 _properties 缓存）。
+    api = sh.client
+    if MAX_WORKERS <= 1:
+        for v, part in plan:
+            build_one_volume(api, sh.id, v, part, raw, pool_off, pool_ids,
+                             n_vol, lock, combo_gid, stats)
+    else:
+        with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = [ex.submit(build_one_volume, api, sh.id, v, part, raw, pool_off,
+                              pool_ids, n_vol, lock, combo_gid, stats)
+                    for v, part in plan]
+            for f in cf.as_completed(futs):
+                f.result()          # 有异常就抛出来，不做静默吞掉
 
     # ---- 自检：回读确认图表真的绑上了数据（防止出现「空图」）----
     try:
@@ -311,6 +363,7 @@ def create_volumes(sh, combos, raw, per_sheet, drop_monthly=False, hide_pool=Tru
         print(f"  （自检跳过：{e}）")
 
     pool_rows = sum(1 + len(raw[k]) for k in combos)
+    vol_cells = sum((len(p) * BLOCK_H + 5) * VOL_COLS for _, p in plan)
     total_new = pool_rows * 2 + vol_cells
     print(f"  占用约 {total_new:,} 格（池 {pool_rows * 2:,} + 卷 {vol_cells:,}）｜上限 {CELL_LIMIT:,}")
     if total_new > CELL_LIMIT * 0.8:
@@ -381,15 +434,21 @@ def update_links(sh, combo_gid):
 
 
 def main():
+    global MAX_WORKERS
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="建多少个药材（0=全部）")
     ap.add_argument("--per-sheet", type=int, default=50, help="每卷放几个药材")
+    ap.add_argument("--jobs", type=int, default=MAX_WORKERS,
+                    help=f"并发建卷的线程数（默认 {MAX_WORKERS}；1=串行）")
     ap.add_argument("--drop-monthly", action="store_true",
                     help="连 history_monthly 一起删（全量建图后用它，工作簿只剩主表+历史图）")
     ap.add_argument("--show-pool", action="store_true",
                     help="不隐藏 daily_pool（默认隐藏，仅调试用）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+
+    MAX_WORKERS = max(1, args.jobs)
 
     with open(DATA_JSON, "r", encoding="utf-8") as f:
         raw = json.load(f)
