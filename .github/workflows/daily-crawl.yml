@@ -30,18 +30,23 @@ jobs:
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      # 如果仓库 secrets 里配了 GSHEET_SA_B64（还原 Google 服务账号密钥要用），
-      # 这一步会把它读出来；没配也不会失败（下面的步骤会自动跳过 Google 相关操作）。
-      # 注意：私有仓库里 secrets 不能直接写在 if: 条件里，只能像这样先落到 outputs。
+      # 检查 secrets 里有没有配 GSHEET_SA_B64（还原 Google 服务账号密钥要用）。
+      # 配了 → 正常推送 Google Sheet；没配 → 自动跳过 Google 相关步骤，只抓数据，任务仍为绿色。
+      # 两个注意点：
+      #   1) secrets 不能直接写在 if: 条件里（私有仓库拿不到值），只能先落到 step outputs；
+      #   2) secrets 通过 env: 传入，不要直接 ${{ secrets.X }} 内联进脚本，避免值被拼进脚本文本。
       - name: 检查是否配置了 GSHEET_SA_B64
         id: sa
         continue-on-error: true
+        env:
+          GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
         run: |
-          if [ -n "${{ secrets.GSHEET_SA_B64 }}" ]; then
+          if [ -n "$GSHEET_SA_B64" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "已配置 GSHEET_SA_B64，本次会推送 Google Sheet"
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::本仓库 secrets 里没有 GSHEET_SA_B64，跳过 Google Sheet 推送，只抓数据。"
+            echo "::warning::本仓库 secrets 里没有 GSHEET_SA_B64，本次只抓数据、不推送 Google Sheet。"
           fi
 
       - name: 准备 Python
