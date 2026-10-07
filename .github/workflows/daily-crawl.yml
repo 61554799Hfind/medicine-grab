@@ -14,6 +14,20 @@ on:
   # 也允许在 GitHub 网页上手动点一下就跑，方便随时测试
   workflow_dispatch:
 
+# GITHUB_TOKEN 默认权限是受限只读（只有 contents/metadata/packages: read），
+# 而「检查今天是否已经抓过」那一步要读本仓库的 workflow 运行记录，
+# 必须显式申请 actions: read，否则请求返回 403、被当成「今天没跑过」，
+# 兜底机制会失效 → 每天跑满 3 次全量，把私有仓库 2000 分钟/月的额度吃掉。
+permissions:
+  contents: read
+  actions: read
+
+# 同一时间只允许一个抓取任务，避免两个触发点重叠时并发抢写 Google Sheet。
+# 后到的会排队等待，等前一个成功结束后再进入跳过判断，从而自动跳过。
+concurrency:
+  group: daily-crawl
+  cancel-in-progress: false
+
 jobs:
   crawl:
     runs-on: ubuntu-latest
@@ -44,7 +58,12 @@ jobs:
           JSON=$(curl -s --max-time 30 -H "Authorization: Bearer $GH_TOKEN" "$URL" || echo '{}')
           N=$(echo "$JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('total_count',0))" 2>/dev/null)
           # 查询失败 / 权限不足时按「今天没跑过」处理：宁可多跑一次，也不能漏跑
-          case "$N" in ''|*[!0-9]*) N=0 ;; esac
+          case "$N" in
+            ''|*[!0-9]*)
+              N=0
+              echo "::warning::查询运行记录失败，本次按「今天没跑过」处理。接口返回前 300 字：$(echo "$JSON" | head -c 300)"
+              ;;
+          esac
           echo "今天（UTC $TODAY）已成功的运行数 = $N"
           if [ "$N" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
