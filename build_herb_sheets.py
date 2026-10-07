@@ -250,11 +250,13 @@ def create_volumes(sh, combos, raw, per_sheet, drop_monthly=False, hide_pool=Tru
                     "chart": {
                         "spec": {
                             "title": s["title"],
+                            # ⚠️ hiddenDimensionStrategy 是 ChartSpec 的字段，不是 basicChart 的。
+                            # 放错层级会直接 400：Unknown name "hiddenDimensionStrategy" at ...basic_chart
+                            # 作用：数据源表 daily_pool 是隐藏的，显式声明不跳过隐藏行列，避免图变空。
+                            "hiddenDimensionStrategy": "SHOW_ALL",
                             "basicChart": {
                                 "chartType": "LINE",
                                 "legendPosition": "NO_LEGEND",
-                                # 数据源表是隐藏的，必须显式声明「不跳过隐藏行列」，否则图会空
-                                "hiddenDimensionStrategy": "SHOW_ALL",
                                 "axis": [
                                     {"position": "BOTTOM_AXIS", "title": "日期"},
                                     {"position": "LEFT_AXIS", "title": "价格(元/kg)"},
