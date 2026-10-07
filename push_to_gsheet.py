@@ -20,6 +20,9 @@ SERVICE_ACCOUNT_FILE = os.environ.get(
 # 从你浏览器地址栏直接提取的表格ID
 SHEET_ID = "1fpy0IiZM-RaXI_XB4VBQvvuD_Wrr6tVm6GrS2uNmSRU"
 
+# 「历史价格」列（第 12 列 / L）不放链接，留空由 build_herb_sheets.py 统一写入表格内跳转。
+# 原因：以前这里会写死一个 127.0.0.1 的本机网页地址，老板点开必然打不开。
+
 
 def push_data(header, rows, failed_list=None, status_msg=""):
     old_timeout = socket.getdefaulttimeout()
@@ -43,10 +46,20 @@ def push_data(header, rows, failed_list=None, status_msg=""):
             ws = sh.add_worksheet(title="medicine_data",
                                   rows=len(rows) + 10, cols=len(header) + 2)
 
-        values = [header] + [[str(c) for c in row] for row in rows]
+        # 分三块写入（跳过历史价格列里的公式由本函数一并写入，保证每天重跑不会把它冲掉）：
+        #   A1:K  → 品名~年对比（前 11 列，含表头）
+        #   L1:L  → 历史价格（超链接，第 12 列）
+        #   M1:M  → 更新日期（第 13 列，最后）
+        left = [header[:11]] + [[str(c) for c in row[:11]] for row in rows]
+        mid_header = header[11] if len(header) > 11 else "历史价格"
+        # 历史价格列只写表头，单元格留空（跳转链接由 build_herb_sheets.py 统一刷新）
+        links = [[mid_header]] + [[""] for i in range(2, len(rows) + 2)]
+        right = [["更新日期"]] + [[str(row[12]) if len(row) > 12 else ""] for row in rows]
         ws.clear()
-        ws.update(values, "A1", value_input_option="RAW")
-        print(f"成功数据已推送到 [medicine_data]：{len(rows)} 行")
+        ws.update(left, "A1", value_input_option="RAW")
+        ws.update(links, "L1", value_input_option="USER_ENTERED")
+        ws.update(right, "M1", value_input_option="RAW")
+        print(f"成功数据已推送到 [medicine_data]：{len(rows)} 行（含「历史价格」链接列）")
 
         # ========== 2. 写入失败名单到 none ==========
         try:
@@ -70,4 +83,53 @@ def push_data(header, rows, failed_list=None, status_msg=""):
     #     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     #     main.update([["最后更新", ts], ["状态", status_msg]], "A1")
     # except Exception as e:
+    #     print(f"[提示] 写状态失败（可忽略）：{e}")
+
+
+# 常见本地代理端口：直连不通时逐个尝试（你只需开着代理，不用管具体端口）
+PROXY_CANDIDATES = [
+    os.environ.get("LOCAL_PROXY", "http://127.0.0.1:3213"),
+    "http://127.0.0.1:3213", "http://127.0.0.1:7890", "http://127.0.0.1:1080",
+    "http://127.0.0.1:1087", "http://127.0.0.1:10809", "http://127.0.0.1:8080",
+]
+
+
+def _is_net_err(e):
+    s = str(e).lower()
+    return any(k in s for k in ("timeout", "timed out", "failed to resolve",
+                                "name or service", "connection refused",
+                                "network is unreachable", "tunnel connection failed",
+                                "max retries exceeded", "proxyerror"))
+
+
+def push_data_auto(header, rows, failed_list=None, status_msg=""):
+    """先直连；网络不通时依次尝试常见本地代理端口。成功返回 True。
+
+    本机场景必须用它：直连 Google 不通，需要走代理；而抓药通网又要关代理，两者互斥，
+    所以抓取（--no-push）和推送分成两步跑。
+    """
+    try:
+        push_data(header, rows, failed_list, status_msg)
+        return True
+    except Exception as e:
+        if not _is_net_err(e):
+            raise
+        print(f"⚠️ 直连 Google 失败：{str(e)[:160]}")
+
+    tried = []
+    for p in PROXY_CANDIDATES:
+        if not p or p in tried:
+            continue
+        tried.append(p)
+        print(f"尝试代理 {p} ...")
+        os.environ["HTTP_PROXY"] = p
+        os.environ["HTTPS_PROXY"] = p
+        try:
+            push_data(header, rows, failed_list, status_msg)
+            print(f"✅ 已通过 {p} 连上 Google")
+            return True
+        except Exception as e2:
+            print(f"   {p} 失败：{str(e2)[:120]}")
+    print("❌ 所有代理端口都失败。请确认代理软件已开启且能上 Google。")
+    return False
     #     print(f"[提示] 写状态失败（可忽略）：{e}")

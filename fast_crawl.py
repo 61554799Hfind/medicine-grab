@@ -86,7 +86,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 PERIODS = [("yesterday", "昨日对比"), ("zhouduibi", "周对比"), ("yueduibi", "月对比"),
            ("jiduibi", "季度对比"), ("nianduibi", "年对比")]
 HEADER = ["品名", "规格", "产地", "原价", "现价(元/kg)", "走势",
-          "昨日对比", "周对比", "月对比", "季度对比", "年对比", "更新日期"]
+          "昨日对比", "周对比", "月对比", "季度对比", "年对比", "历史价格", "更新日期"]
 
 # 节奏档位：(请求间隔秒, 每味药之间的间隔秒)
 SPEED = {
@@ -469,7 +469,7 @@ def main():
                       f"当前间隔 {c.gap:.2f}s")
                 with open(progress_json, "w", encoding="utf-8") as f:
                     json.dump(done, f, ensure_ascii=False)
-                save_csv(out_csv, HEADER, [[*r, today] for r in all_rows])
+                save_csv(out_csv, HEADER, [[*r, "", today] for r in all_rows])
             time.sleep(c.med_gap)
     finally:
         c.stop()
@@ -477,7 +477,7 @@ def main():
             json.dump(done, f, ensure_ascii=False)
 
     el = time.time() - t0
-    final_rows = [[*r, today] for r in all_rows]
+    final_rows = [[*r, "", today] for r in all_rows]  # 第12列空出给「历史价格」，更新日期放最后
     save_csv(out_csv, HEADER, final_rows)
 
     if failed:

@@ -12,6 +12,11 @@ failed_medicines.txt
 试跑结果.csv
 *.csv
 
+# 历史价格抓取产物（数据量大，CI 会重新生成）
+history_data.json
+history_progress.json
+history_crawl.log
+
 # 编辑器与本地工作数据
 .idea/
 .workbuddy/
