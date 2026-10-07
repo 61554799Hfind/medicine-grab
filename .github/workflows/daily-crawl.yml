@@ -1,31 +1,24 @@
 name: 每日药材价格抓取
 
 on:
-  # 每天 3 个时间点（cron 用 UTC，= 北京时间 - 8 小时）：
-  #   UTC 00:17 → 北京 08:17（主时间）
-  #   UTC 03:17 → 北京 11:17（兜底）
-  #   UTC 06:17 → 北京 14:17（兜底）
-  # 为什么要设 3 次：GitHub 官方文档明确说明，定时任务在高负载时会被「延迟」，
-  # 负载足够高时「部分排队的任务会被直接丢弃」——单点触发不可靠。
-  # 后两次是补跑机会，如果今天已经成功抓过会自动跳过（见第一步）。
-  # 三个时间点都要避开整点，整点是 GitHub 负载最高的时候。
+  # 每天北京时间 08:17 跑一次（cron 用 UTC，= 北京时间 - 8 小时 → UTC 00:17）。
+  # 错开整点：整点是 GitHub 负载最高的时候，容易延迟或被丢弃。
   schedule:
-    - cron: '17 0,3,6 * * *'
+    - cron: '17 0 * * *'
   # 也允许在 GitHub 网页上手动点一下就跑，方便随时测试
   workflow_dispatch:
 
 # GITHUB_TOKEN 默认权限是受限只读（只有 contents/metadata/packages: read），
-# 而「检查今天是否已经抓过」那一步要读本仓库的 workflow 运行记录，
-# 必须显式申请 actions: read，否则请求返回 403、被当成「今天没跑过」，
-# 兜底机制会失效 → 每天跑满 3 次全量，把私有仓库 2000 分钟/月的额度吃掉。
+# 访问 actions 相关接口必须显式申请。
 permissions:
   contents: read
   actions: read
 
-# 同一时间只允许一个抓取任务，避免两个触发点重叠时并发抢写 Google Sheet。
-# 后到的会排队等待，等前一个成功结束后再进入跳过判断，从而自动跳过。
+# ⚠️ 同一时间只允许一个抓取任务。注意这个 group 名不要和 job 上的名称撞车，
+# 否则 GitHub 会报 "a deadlock was detected for concurrency group" 直接取消运行。
+# 现在只保留这一处 concurrency 定义。
 concurrency:
-  group: daily-crawl
+  group: medicine-daily-crawl
   cancel-in-progress: false
 
 jobs:
@@ -33,102 +26,72 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180     # 抓取约 20 分钟 + 分卷建大图（100 万行数据池 + 900+ 图表）较重，留足余量
 
-    # GITHUB_TOKEN 默认权限是「只读」，必须显式申请：
-    #   actions: read  → 第一步查询「今天是否已经成功跑过」要用（缺了会 403，导致每天跑 3 次全量）
-    #   contents: write → 预留（现在不再提交网页，但保留权限方便以后扩展）
-    permissions:
-      actions: read
-      contents: write
-
-    # 三个时间点可能撞在一起，加锁避免同时写同一张表
-    concurrency:
-      group: daily-crawl
-      cancel-in-progress: false
-
     steps:
-      # 兜底机制的前提：同一天只真正抓一次。
-      # 如果今天已经有成功的运行，本次直接跳过（跳过时整个任务约 10 秒，几乎不耗额度）。
-      - name: 检查今天是否已经抓过
-        id: chk
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TODAY=$(date -u +%F)
-          URL="https://api.github.com/repos/${{ github.repository }}/actions/workflows/daily-crawl.yml/runs?status=success&created=$TODAY&per_page=1"
-          JSON=$(curl -s --max-time 30 -H "Authorization: Bearer $GH_TOKEN" "$URL" || echo '{}')
-          N=$(echo "$JSON" | python3 -c "import sys,json;print(json.load(sys.stdin).get('total_count',0))" 2>/dev/null)
-          # 查询失败 / 权限不足时按「今天没跑过」处理：宁可多跑一次，也不能漏跑
-          case "$N" in
-            ''|*[!0-9]*)
-              N=0
-              echo "::warning::查询运行记录失败，本次按「今天没跑过」处理。接口返回前 300 字：$(echo "$JSON" | head -c 300)"
-              ;;
-          esac
-          echo "今天（UTC $TODAY）已成功的运行数 = $N"
-          if [ "$N" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "今天已经成功抓取过，本次跳过（这是兜底触发，属正常现象）"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "今天还没抓过，开始执行"
-          fi
-
+      # 如果仓库 secrets 里配了 GSHEET_SA_B64（还原 Google 服务账号密钥要用），
+      # 这一步会把它读出来；没配也不会失败（下面那步会给出明确提示）。
       - name: 拉取代码
-        if: steps.chk.outputs.skip != 'true'
         uses: actions/checkout@v4
 
+      - name: 试图读取 GSHEET_SA_B64（配了才生效）
+        id: sa
+        continue-on-error: true
+        run: |
+          if [ -n "${{ secrets.GSHEET_SA_B64 }}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::本仓库 secrets 里没有 GSHEET_SA_B64，跳过 Google Sheet 推送，只抓数据。"
+          fi
+
       - name: 准备 Python
-        if: steps.chk.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 安装依赖
-        if: steps.chk.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
       - name: 还原 Google 服务账号密钥
-        if: steps.chk.outputs.skip != 'true'
+        if: steps.sa.outputs.ok == 'true'
         env:
           GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
-        run: |
-          if [ -z "$GSHEET_SA_B64" ]; then
-            echo "::error::未配置 GSHEET_SA_B64 密钥，无法推送 Google Sheet"
-            exit 1
-          fi
-          echo "$GSHEET_SA_B64" | base64 -d > service_account.json
+        run: echo "$GSHEET_SA_B64" | base64 -d > service_account.json
 
+      # 抓取药材涨落数据，并推送到 Google Sheet 的 medicine_data（没配密钥时只抓不推）
       - name: 抓取数据并推送
-        if: steps.chk.outputs.skip != 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
           TZ: Asia/Shanghai
-        run: python fast_crawl.py --alias
+        run: |
+          if [ "${{ steps.sa.outputs.ok }}" = "true" ]; then
+            python fast_crawl.py --alias
+          else
+            python fast_crawl.py --alias --no-push
+          fi
 
+      # 抓历史日价格（接口一次返回全部，很快）
       - name: 抓取历史价格日数据
-        if: steps.chk.outputs.skip != 'true'
         env:
           TZ: Asia/Shanghai
-        run: python history_crawl.py
+        run: python history_crawl.py --incremental
 
       # 「分卷」模式：每卷一张表、每卷 50 个药材，每块 = 官网样式大折线图 + 年×月表。
-      # 926 个药材 → 19 张卷表（Google 单工作簿上限 200 张），
+      # 药材 → 约 20 张卷表（Google 单工作簿上限 200 张），
       # 逐日原始数据集中放 daily_pool（自动隐藏），卷表只放区块，图表跨表引用。
       # 链接 = #gid=<卷表>&range=A<块首行>，跳过去并滚到该药材那一块。
       # 每次运行先删旧的「历史图*」+ 池表 + history_daily/history_index/history_monthly 再重建，
-      # 所以是覆盖式更新，不会残留昨天的图；工作簿最终只剩 主表 + 历史图1…19。
+      # 所以是覆盖式更新，不会残留昨天的图。
       - name: 建药材历史价格大图（分卷，覆盖更新）
-        if: steps.chk.outputs.skip != 'true'
+        if: steps.sa.outputs.ok == 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
           TZ: Asia/Shanghai
         run: python build_herb_sheets.py --per-sheet 50 --drop-monthly
 
       - name: 结果自检
-        if: steps.chk.outputs.skip != 'true'
         run: |
           lines=$(wc -l < 药材涨落对比结果.csv)
           echo "CSV 行数（含表头）：$lines"
@@ -140,7 +103,7 @@ jobs:
       # 抓取脚本在推送失败时只打一行日志、不会让任务失败。
       # 没有这一步，推送失败时任务照样显示绿色，表格不更新你也不会收到通知。
       - name: 校验 Google Sheet 推送结果
-        if: steps.chk.outputs.skip != 'true'
+        if: steps.sa.outputs.ok == 'true'
         run: |
           if grep -q "推送成功" crawl.log; then
             echo "Google Sheet 推送成功"
@@ -151,7 +114,7 @@ jobs:
           fi
 
       - name: 保存结果文件
-        if: always() && steps.chk.outputs.skip != 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: 药材数据-${{ github.run_number }}
