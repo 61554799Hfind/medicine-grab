@@ -27,12 +27,13 @@ jobs:
     timeout-minutes: 180     # 抓取约 20 分钟 + 分卷建大图（100 万行数据池 + 900+ 图表）较重，留足余量
 
     steps:
-      # 如果仓库 secrets 里配了 GSHEET_SA_B64（还原 Google 服务账号密钥要用），
-      # 这一步会把它读出来；没配也不会失败（下面那步会给出明确提示）。
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: 试图读取 GSHEET_SA_B64（配了才生效）
+      # 如果仓库 secrets 里配了 GSHEET_SA_B64（还原 Google 服务账号密钥要用），
+      # 这一步会把它读出来；没配也不会失败（下面的步骤会自动跳过 Google 相关操作）。
+      # 注意：私有仓库里 secrets 不能直接写在 if: 条件里，只能像这样先落到 outputs。
+      - name: 检查是否配置了 GSHEET_SA_B64
         id: sa
         continue-on-error: true
         run: |
