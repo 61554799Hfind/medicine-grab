@@ -17,8 +17,15 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 # 服务端可通过环境变量指定密钥路径（CI 里从 secrets 还原出来的临时文件）
 SERVICE_ACCOUNT_FILE = os.environ.get(
     "SERVICE_ACCOUNT_FILE", os.path.join(_BASE, "service_account.json"))
-# 从你浏览器地址栏直接提取的表格ID
-SHEET_ID = "1fpy0IiZM-RaXI_XB4VBQvvuD_Wrr6tVm6GrS2uNmSRU"
+# 目标表格ID：以 push_history.py 为唯一来源（那里也支持环境变量 SHEET_ID 覆盖）。
+# 想换表时不用改代码：设环境变量 SHEET_ID 即可，例如
+#   Windows:  set SHEET_ID=1FwyR-...
+#   CI:       仓库 Settings → Secrets → 新增 SHEET_ID
+try:
+    from push_history import SHEET_ID
+except Exception:  # 单独使用本文件时兜底
+    SHEET_ID = os.environ.get("SHEET_ID", "").strip() or \
+        "***REMOVED***"
 
 # 「历史价格」列（第 12 列 / L）不放链接，留空由 build_herb_sheets.py 统一写入表格内跳转。
 # 原因：以前这里会写死一个 127.0.0.1 的本机网页地址，老板点开必然打不开。

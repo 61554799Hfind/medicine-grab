@@ -51,7 +51,10 @@ def _month_val(vals):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_JSON = os.path.join(BASE_DIR, "history_data.json")
-SHEET_ID = "1fpy0IiZM-RaXI_XB4VBQvvuD_Wrr6tVm6GrS2uNmSRU"
+# 目标表格ID。想换表不用改代码：设环境变量 SHEET_ID 覆盖即可。
+# 全项目只有本文件这一处权威定义，push_to_gsheet.py / build_herb_sheets.py 都从这里取值。
+DEFAULT_SHEET_ID = "***REMOVED***"
+SHEET_ID = os.environ.get("SHEET_ID", "").strip() or DEFAULT_SHEET_ID
 SERVICE_ACCOUNT_FILE = os.environ.get(
     "SERVICE_ACCOUNT_FILE", os.path.join(BASE_DIR, "service_account.json"))
 LOCAL_PROXY = os.environ.get("LOCAL_PROXY", "http://127.0.0.1:3213")

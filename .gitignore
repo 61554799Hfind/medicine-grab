@@ -25,3 +25,9 @@ history_crawl.log
 __pycache__/
 .venv/
 *.pyc
+
+# 临时探测/调试文件（下划线开头，用完即弃，不进仓库）
+_*.py
+_*.txt
+_*.log
+_*.json

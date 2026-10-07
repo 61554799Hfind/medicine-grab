@@ -91,11 +91,17 @@ jobs:
       # 每次运行先删旧的「历史图*」+ 池表 + history_daily/history_index/history_monthly 再重建，
       # 所以是覆盖式更新，不会残留昨天的图。
       # --jobs 6：并发建卷。建图是纯网络等待，1591 个图串行要十几分钟，并发能快好几倍。
+      # 配额说明（官方）：写请求 300/分钟/项目，但「每用户」只有 60/分钟；服务账号算一个用户。
+      #   所以脚本内置全局限速 GS_RATE_PER_SEC=0.9（≈54/分钟，留余量），外加 429 指数退避重试。
+      #   「一个 batch 请求只算 1 次配额」，故 CHART_BATCH 调大到 100（1591 图只要 16 次请求）。
+      #   官方明确：不超每分钟配额就没有每日总量上限 —— 不会被封，超了只是返回 429 等一分钟。
       - name: 建药材历史价格大图（分卷，覆盖更新）
         if: steps.sa.outputs.ok == 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
           TZ: Asia/Shanghai
+          GS_RATE_PER_SEC: '0.9'
+          CHART_BATCH: '100'
         run: python build_herb_sheets.py --per-sheet 50 --drop-monthly --jobs 6
 
       - name: 结果自检

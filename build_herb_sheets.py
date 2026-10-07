@@ -32,6 +32,8 @@ import concurrent.futures as cf
 import json
 import math
 import os
+import random
+import re
 import threading
 import time
 from collections import defaultdict
@@ -74,6 +76,73 @@ def ws_write_values(client, sheet_id, a1, values, vio="RAW"):
     )
 
 
+# ---------------------------------------------------------------------------
+# 限速 + 429 退避重试
+# ---------------------------------------------------------------------------
+# Google Sheets API 的配额是「每分钟请求数」，不是「每天总量」。一次性并发打太猛
+# 会收到 429（RATE_LIMIT_EXCEEDED），它只是**限流不是封号**，等几十秒就恢复。
+# 这里做两件事：
+#   ① 全局令牌桶限速，把请求摊平，尽量不撞线；
+#   ② 万一撞到 429/5xx，指数退避重试（2s→4s→8s…最长 60s），最多 8 次。
+RETRY_STATUS = {429, 500, 502, 503, 504}
+MAX_RETRY = int(os.environ.get("GS_MAX_RETRY", "8"))
+# 官方限额（developers.google.com/workspace/sheets/api/limits）：
+#   写请求 300/分钟/项目，但 **60/分钟/用户/项目**；服务账号算「一个用户」。
+#   → 本项目实际卡在 60 次/分钟。取 0.9/s（≈54/分钟）留 10% 余量。
+# 注意：官方明确「只要不超每分钟配额，每天请求数没有上限」，所以没有日封顶。
+RATE_PER_SEC = float(os.environ.get("GS_RATE_PER_SEC", "0.9"))
+MIN_INTERVAL = 1.0 / RATE_PER_SEC if RATE_PER_SEC > 0 else 0.0
+
+_rate_lock = threading.Lock()
+_rate_next = [0.0]      # 下一个可用的请求时刻（全局排队，多线程共用）
+
+
+def _rate_wait():
+    """全局排队：相邻两个 API 请求至少间隔 MIN_INTERVAL 秒。"""
+    if MIN_INTERVAL <= 0:
+        return
+    with _rate_lock:
+        now = time.time()
+        slot = max(_rate_next[0], now)
+        _rate_next[0] = slot + MIN_INTERVAL
+        wait = slot - now
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _status_of(e):
+    """从 gspread 异常里抠出 HTTP 状态码（gspread 的 APIError 文本形如 '[429]: ...'）"""
+    try:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code:
+            return int(code)
+    except Exception:
+        pass
+    m = re.search(r"\[(\d{3})\]", str(e))
+    return int(m.group(1)) if m else None
+
+
+def api(fn, *args, **kwargs):
+    """带限速 + 429/5xx 指数退避的 Google API 调用包装。用法：api(sh.batch_update, body)"""
+    delay = 2.0
+    for attempt in range(1, MAX_RETRY + 1):
+        _rate_wait()
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            status = _status_of(e)
+            msg = str(e)
+            transient = (status in RETRY_STATUS) or ("RATE_LIMIT" in msg) or \
+                        (status is not None and 500 <= status < 600)
+            if not transient or attempt == MAX_RETRY:
+                raise
+            sleep_s = min(delay, 60) + random.uniform(0, 1.5)
+            print(f"  ⏳ Google API {status or '?'} 限流/临时故障，"
+                  f"{sleep_s:.0f}s 后重试（第 {attempt}/{MAX_RETRY} 次）")
+            time.sleep(sleep_s)
+            delay *= 2
+
+
 MONTH_HEADERS = [f"{m}月" for m in range(1, 13)]
 
 BLOCK_H = 22          # 每个药材占的行数
@@ -85,7 +154,9 @@ VOL_PREFIX = "历史图"
 POOL_NAME = "daily_pool"     # 逐日原始数据池（默认隐藏）
 MAX_POOL_ROWS = 500_000      # 单张池表最多行数（超限自动拆成 daily_pool_2 ...）
 POOL_CHUNK = 25_000          # 每次 API 写入的行数
-CHART_BATCH = 25             # 每批 addChart 请求数
+# 每批 addChart 请求数。官方明确「一个 batch 请求（含子请求）只算 1 次配额」，
+# 所以批越大越省配额：1591 个图 → 25/批要 64 次请求，100/批只要 16 次。
+CHART_BATCH = int(os.environ.get("CHART_BATCH", "100"))
 MAX_WORKERS = 4              # 并发建卷的线程数（建图是纯网络等待，并发能快好几倍）
 MAX_SHEETS = 200
 CELL_LIMIT = 10_000_000
@@ -173,7 +244,7 @@ def write_pool(sh, combos, raw, hide=True):
     for i, keys in enumerate(pools):
         title = POOL_NAME if i == 0 else f"{POOL_NAME}_{i + 1}"
         rows = sum(1 + len(raw[k]) for k in keys) + 2
-        ws = sh.add_worksheet(title=title, rows=rows, cols=2)
+        ws = api(sh.add_worksheet, title=title, rows=rows, cols=2)
         ids.append(ws.id)
 
         buf, base = [], 0
@@ -197,7 +268,7 @@ def write_pool(sh, combos, raw, hide=True):
         print(f"  ✅ {title}：{len(keys)} 个药材 / {rows - 2:,} 行 × 2 列")
 
     if hide:
-        sh.batch_update({"requests": [{
+        api(sh.batch_update, {"requests": [{
             "updateSheetProperties": {
                 "properties": {"sheetId": pid, "hidden": True},
                 "fields": "hidden",
@@ -297,12 +368,12 @@ def build_one_volume(client, sheet_id, v, part, raw, pool_off, pool_ids, n_vol,
 
     # 2) 写区块内容（A1 自带表名，走 sheet_id，线程安全）
     block_area, specs = plan_volume(part, raw, pool_off, pool_ids)
-    ws_write_values(client, sheet_id, f"'{title}'!A1", block_area, "RAW")
+    api(ws_write_values, client, sheet_id, f"'{title}'!A1", block_area, "RAW")
 
     # 3) 批量建图（分批提交，避免单批过大）
     reqs = [build_chart_req(s, sid) for s in specs]
     for i in range(0, len(reqs), CHART_BATCH):
-        client.batch_update(sheet_id, {"requests": reqs[i:i + CHART_BATCH]})
+        api(client.batch_update, sheet_id, {"requests": reqs[i:i + CHART_BATCH]})
 
     with lock:
         for s in specs:
@@ -378,7 +449,7 @@ def ensure_link_column(sh):
     if "历史价格" in header:
         return header.index("历史价格") + 1
     idx = header.index("更新日期") if "更新日期" in header else len(header)
-    sh.batch_update({"requests": [{
+    api(sh.batch_update, {"requests": [{
         "insertDimension": {
             "range": {"sheetId": wd.id, "dimension": "COLUMNS",
                       "startIndex": idx, "endIndex": idx + 1},
@@ -491,7 +562,18 @@ def main():
                 SERVICE_ACCOUNT_FILE,
                 scopes=["https://www.googleapis.com/auth/spreadsheets"])
             client = gspread.authorize(creds)
-            sh = client.open_by_key(SHEET_ID)
+            try:
+                sh = client.open_by_key(SHEET_ID)
+            except gspread.SpreadsheetNotFound:
+                raise SystemExit(
+                    f"\n❌ 打不开表格 {SHEET_ID}\n"
+                    f"   原因只有一个：这张表还没共享给服务账号。\n"
+                    f"   请把下面这个邮箱加到表格的「共享」里，权限选【编辑者】：\n"
+                    f"       {creds.service_account_email}\n")
+            except gspread.exceptions.APIError as e:
+                raise SystemExit(f"\n❌ Google API 拒绝：{e}\n"
+                                 f"   （若提示 PERMISSION_DENIED，同上：把 "
+                                 f"{creds.service_account_email} 加为编辑者）")
         finally:
             socket.setdefaulttimeout(old)
         gid = create_volumes(sh, combos, raw, args.per_sheet,
