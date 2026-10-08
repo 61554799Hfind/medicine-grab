@@ -90,8 +90,11 @@ MAX_RETRY = int(os.environ.get("GS_MAX_RETRY", "8"))
 #   写请求 300/分钟/项目，但 **60/分钟/用户/项目**；服务账号算「一个用户」。
 #   → 本项目实际卡在 60 次/分钟。取 0.9/s（≈54/分钟）留 10% 余量。
 # 注意：官方明确「只要不超每分钟配额，每天请求数没有上限」，所以没有日封顶。
-RATE_PER_SEC = float(os.environ.get("GS_RATE_PER_SEC", "0.9"))
+RATE_PER_SEC = float(os.environ.get("GS_RATE_PER_SEC", "0.75"))  # 0.75/s ≈ 45/分钟，留 25% 余量
 MIN_INTERVAL = 1.0 / RATE_PER_SEC if RATE_PER_SEC > 0 else 0.0
+# 撞到 429 时最小等待秒数。官方说配额「每分钟补充一次」，所以至少等满一分钟再试，
+# 否则 2s/4s/8s 这种短退避会在配额还没补充前白白再撞几次。
+QUOTA_WAIT = float(os.environ.get("GS_QUOTA_WAIT", "70"))
 
 _rate_lock = threading.Lock()
 _rate_next = [0.0]      # 下一个可用的请求时刻（全局排队，多线程共用）
@@ -136,7 +139,11 @@ def api(fn, *args, **kwargs):
                         (status is not None and 500 <= status < 600)
             if not transient or attempt == MAX_RETRY:
                 raise
-            sleep_s = min(delay, 60) + random.uniform(0, 1.5)
+            if status == 429:
+                # 配额是按分钟补充的，短退避没意义，直接等满一分钟多一点
+                sleep_s = QUOTA_WAIT + random.uniform(0, 5)
+            else:
+                sleep_s = min(delay, 60) + random.uniform(0, 1.5)
             print(f"  ⏳ Google API {status or '?'} 限流/临时故障，"
                   f"{sleep_s:.0f}s 后重试（第 {attempt}/{MAX_RETRY} 次）")
             time.sleep(sleep_s)
@@ -224,12 +231,12 @@ def cleanup_old(sh, drop_monthly):
     if drop_monthly:
         targets.append("history_monthly")
     removed = []
-    for ws in list(sh.worksheets()):
+    for ws in list(api(sh.worksheets)):
         t = ws.title
         if (t == POOL_NAME or t.startswith(POOL_NAME + "_")
                 or t.startswith(VOL_PREFIX)
                 or t in targets):
-            sh.del_worksheet(ws)
+            api(sh.del_worksheet, ws)   # 删除也算写请求，36 张表就是 36 次，必须限速
             removed.append(t)
     if removed:
         print(f"  🧹 已删除上一轮的 {len(removed)} 张表：{'、'.join(removed)}")
@@ -254,7 +261,9 @@ def write_pool(sh, combos, raw, hide=True):
             if not buf:
                 return
             a1 = f"A{base + 1}:B{base + len(buf)}"
-            _update_range(ws, a1, buf, "USER_ENTERED")   # USER_ENTERED：日期变真日期，横轴才正常
+            # USER_ENTERED：日期变真日期，横轴才正常
+            # 必须过 api()：池表有 70 次写入，不限速会直接打爆 60 次/分钟的写配额
+            api(_update_range, ws, a1, buf, "USER_ENTERED")
             base += len(buf)
             buf = []
 
@@ -360,7 +369,7 @@ def build_one_volume(client, sheet_id, v, part, raw, pool_off, pool_ids, n_vol,
     t0 = time.time()
 
     # 1) 建表（卷表已经由 cleanup_old 删干净了，直接新建；建表请求会顺手返回新表的 sheetId）
-    res = client.batch_update(sheet_id, {"requests": [{"addSheet": {
+    res = api(client.batch_update, sheet_id, {"requests": [{"addSheet": {
         "properties": {"title": title,
                        "gridProperties": {"rowCount": 20, "columnCount": VOL_COLS}},
     }}]})
@@ -417,7 +426,7 @@ def create_volumes(sh, combos, raw, per_sheet, drop_monthly=False, hide_pool=Tru
 
     # ---- 自检：回读确认图表真的绑上了数据（防止出现「空图」）----
     try:
-        meta = sh.fetch_sheet_metadata(
+        meta = api(sh.fetch_sheet_metadata,
             {"fields": "sheets(properties(title),charts(chartSpec(basicChart(series(series(sourceRange(sources)))))))"})
         ok = 0
         for s in meta.get("sheets", []):
@@ -444,8 +453,8 @@ def create_volumes(sh, combos, raw, per_sheet, drop_monthly=False, hide_pool=Tru
 
 def ensure_link_column(sh):
     """确保 medicine_data 有「历史价格」列，返回列号（1-based）"""
-    wd = sh.worksheet("medicine_data")
-    header = wd.row_values(1)
+    wd = api(sh.worksheet, "medicine_data")
+    header = api(wd.row_values, 1)
     if "历史价格" in header:
         return header.index("历史价格") + 1
     idx = header.index("更新日期") if "更新日期" in header else len(header)
@@ -456,24 +465,24 @@ def ensure_link_column(sh):
             "inheritFromBefore": False,
         }
     }]})
-    wd.update_cell(1, idx + 1, "历史价格")
+    api(wd.update_cell, 1, idx + 1, "历史价格")
     print(f"  ➕ medicine_data 缺「历史价格」列，已插到第 {idx + 1} 列")
     return idx + 1
 
 
 def update_links(sh, combo_gid):
     hi = ensure_link_column(sh)
-    wd = sh.worksheet("medicine_data")
-    vals = wd.get_all_values()
+    wd = api(sh.worksheet, "medicine_data")
+    vals = api(wd.get_all_values)
     if len(vals) < 2:
         print("⚠️ medicine_data 是空的，跳过")
         return
 
     row_map, mgid = {}, None
     try:
-        wm = sh.worksheet("history_monthly")
+        wm = api(sh.worksheet, "history_monthly")
         mgid = wm.id
-        for i, r in enumerate(wm.get_all_values()[1:], start=2):
+        for i, r in enumerate(api(wm.get_all_values)[1:], start=2):
             if len(r) >= 3:
                 row_map[f"{r[0]}|{r[1]}|{r[2]}"] = i
     except gspread.WorksheetNotFound:
@@ -495,7 +504,7 @@ def update_links(sh, combo_gid):
             blank += 1
 
     col = col_letter(hi)
-    _update_range(wd, f"{col}2:{col}{len(vals)}", formulas, "USER_ENTERED")
+    api(_update_range, wd, f"{col}2:{col}{len(vals)}", formulas, "USER_ENTERED")
     msg = f"✅ 链接列已更新：{hit} 行跳大图"
     if mgid is not None:
         msg += f"，其余 {len(vals) - 1 - hit - blank} 行仍跳 history_monthly"
