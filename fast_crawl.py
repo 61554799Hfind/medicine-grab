@@ -117,7 +117,9 @@ class Crawler:
     # ---------- 日志 ----------
     def log(self, msg=""):
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-        print(line)
+        # flush=True：CI 里 stdout 是管道，不刷新的话日志会攒在缓冲区里，
+        # 页面上看起来像"卡住不动、没有输出"（实际在跑）。
+        print(line, flush=True)
         try:                      # 收尾阶段日志文件可能已关闭，不能因此崩掉
             self.log_fh.write(line + "\n")
             self.log_fh.flush()
@@ -405,7 +407,7 @@ def main():
 
     alias_map = load_alias() if args.alias else {}
     if alias_map:
-        print(f"已启用别名表：{len(alias_map)} 条")
+        print(f"已启用别名表：{len(alias_map)} 条", flush=True)
 
     speed = "turbo" if args.turbo else ("slow" if args.slow else "normal")
     meds = load_medicines(args.limit or None)
@@ -423,7 +425,7 @@ def main():
         try:
             with open(progress_json, "r", encoding="utf-8") as f:
                 done = json.load(f)
-            print(f"读取断点：已完成 {len(done)} 味，将跳过")
+            print(f"读取断点：已完成 {len(done)} 味，将跳过", flush=True)
         except Exception:
             done = {}
 
@@ -454,6 +456,9 @@ def main():
             if rows:
                 all_rows += rows
                 done[name] = {"rows": rows}
+                # 每味都打一行：CI 里能实时看到"确实在动"，
+                # 也便于某味卡住时定位（之前只在每 10 味才有一行进度，看着像死机）
+                c.log(f"  ✅ {name} → {len(rows)} 行")
             else:
                 failed.append(f"{name} (无数据)")
                 done[name] = {"rows": []}
