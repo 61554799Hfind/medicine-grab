@@ -98,19 +98,33 @@ QUOTA_WAIT = float(os.environ.get("GS_QUOTA_WAIT", "70"))
 
 _rate_lock = threading.Lock()
 _rate_next = [0.0]      # 下一个可用的请求时刻（全局排队，多线程共用）
+# 实际生效的间隔（可变）。撞到 429 后会自适应调大，避免重试完又立刻撞线。
+_rate_cfg = {"interval": MIN_INTERVAL}
 
 
 def _rate_wait():
-    """全局排队：相邻两个 API 请求至少间隔 MIN_INTERVAL 秒。"""
-    if MIN_INTERVAL <= 0:
+    """全局排队：相邻两个 API 请求至少间隔 _rate_cfg['interval'] 秒。"""
+    interval = _rate_cfg["interval"]
+    if interval <= 0:
         return
     with _rate_lock:
         now = time.time()
         slot = max(_rate_next[0], now)
-        _rate_next[0] = slot + MIN_INTERVAL
+        _rate_next[0] = slot + interval
         wait = slot - now
     if wait > 0:
         time.sleep(wait)
+
+
+def _slow_down():
+    """撞到 429 后把全局限速调慢 1.5 倍（最多降到 5s/次 ≈ 12 次/分钟）。"""
+    with _rate_lock:
+        old = _rate_cfg["interval"]
+        new = min(old * 1.5, 5.0)
+        if new != old:
+            _rate_cfg["interval"] = new
+            print(f"  🐢 已把限速从 {old:.2f}s/次 降到 {new:.2f}s/次"
+                  f"（≈{60 / new:.0f} 次/分钟）")
 
 
 def _status_of(e):
@@ -142,6 +156,7 @@ def api(fn, *args, **kwargs):
             if status == 429:
                 # 配额是按分钟补充的，短退避没意义，直接等满一分钟多一点
                 sleep_s = QUOTA_WAIT + random.uniform(0, 5)
+                _slow_down()        # 同时把后续请求整体放慢，防止重试完又撞线
             else:
                 sleep_s = min(delay, 60) + random.uniform(0, 1.5)
             print(f"  ⏳ Google API {status or '?'} 限流/临时故障，"
