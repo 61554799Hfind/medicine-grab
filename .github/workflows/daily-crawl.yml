@@ -81,11 +81,35 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
+      # 容错设计：Secret 里贴「base64 串」或「JSON 原文」都能用，并自动清掉 Windows
+      # 复制带进来的 \r（用 Out-File 存的文件是 CRLF，粘进来会让 base64 -d 报 invalid input）。
+      # 解出来后立刻用 python 校验内容，避免"文件写出来了但不对"要到很后面才炸。
       - name: 还原 Google 服务账号密钥
         if: steps.sa.outputs.ok == 'true'
         env:
           GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
-        run: echo "$GSHEET_SA_B64" | base64 -d > service_account.json
+        run: |
+          RAW="$GSHEET_SA_B64"
+          STRIP=$(printf '%s' "$RAW" | tr -d '[:space:]')
+          if [ -z "$STRIP" ]; then
+            echo "::error::Secret GSHEET_SA_B64 是空的，请重新粘贴"
+            exit 1
+          fi
+          if [ "${STRIP:0:1}" = "{" ]; then
+            echo "Secret 里是 JSON 原文，直接写入 service_account.json"
+            printf '%s' "$RAW" > service_account.json
+          else
+            echo "按 base64 解码（长度 ${#STRIP}，已自动去掉换行/空格/回车）"
+            if ! printf '%s' "$STRIP" | base64 -d > service_account.json 2>/dev/null; then
+              echo "::error::GSHEET_SA_B64 既不是 JSON 也不是合法 base64"
+              echo "  长度 = ${#STRIP}"
+              echo "  开头 = ${STRIP:0:16}"
+              echo "  结尾 = ${STRIP: -16}"
+              echo "  合法值只由 A-Z a-z 0-9 + / = 组成；若出现 { \" -----BEGIN 或中文，说明粘错了内容。"
+              exit 1
+            fi
+          fi
+          python -c "import json;d=json.load(open('service_account.json',encoding='utf-8'));assert d.get('type')=='service_account','不是 service_account 类型';assert 'private_key' in d,'缺 private_key';print('密钥校验通过:',d.get('client_email'),'| key_id =',d.get('private_key_id'))"
 
       # 抓取药材涨落数据，并推送到 Google Sheet 的 medicine_data（没配密钥时只抓不推）
       - name: 抓取数据并推送
