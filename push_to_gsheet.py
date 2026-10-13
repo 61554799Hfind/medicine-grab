@@ -22,10 +22,11 @@ SERVICE_ACCOUNT_FILE = os.environ.get(
 #   Windows:  set SHEET_ID=1FwyR-...
 #   CI:       仓库 Settings → Secrets → 新增 SHEET_ID
 try:
-    from push_history import SHEET_ID, resolve_sheet_id
+    from push_history import SHEET_ID, resolve_sheet_id, require_sheet_id
 except Exception:  # 单独使用本文件时兜底
     SHEET_ID = os.environ.get("SHEET_ID", "").strip()
     resolve_sheet_id = None
+    require_sheet_id = None
 # 注意：这里刻意不写死表格 ID（仓库要公开）。
 # 取不到就留空，真正使用前由 require_sheet_id() 给出明确报错。
 
@@ -34,7 +35,13 @@ except Exception:  # 单独使用本文件时兜底
 
 
 def push_data(header, rows, failed_list=None, status_msg=""):
-    sid = require_sheet_id() if resolve_sheet_id else (SHEET_ID or "")
+    # ⚠️ 这里以前写成 `require_sheet_id() if resolve_sheet_id else ...`，
+    # 但上面只 import 了 resolve_sheet_id，导致 NameError 被上层 except 吃掉，
+    # 表现成"C I 里推送失败但只说一句推送失败"，很难查。取值统一走这条链。
+    if require_sheet_id is not None:
+        sid = require_sheet_id()
+    else:
+        sid = (SHEET_ID or os.environ.get("SHEET_ID", "")).strip()
     if not sid:
         raise RuntimeError("没找到表格 ID：请建 sheet_id.txt 或设环境变量 SHEET_ID")
     old_timeout = socket.getdefaulttimeout()

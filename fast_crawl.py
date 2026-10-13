@@ -47,6 +47,7 @@ import os
 import random
 import re
 import time
+import traceback
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -375,14 +376,23 @@ def push_gsheet(header, rows, failed, proxy_candidates=None):
         else:
             tag = "（直连）"
         try:
-            from push_to_gsheet import push_data
+            from push_to_gsheet import push_data, _is_net_err
             status = "正常" if not failed else f"部分失败({len(failed)}个)"
             push_data(header, rows, failed_list=failed, status_msg=status)
             print(f"Google Sheet 推送成功{tag}")
             return True
         except Exception as e:
             last_err = str(e)
-            print(f"⚠️ 推送失败{tag}：{str(e)[:120]}")
+            print(f"⚠️ 推送失败{tag}：{str(e)[:200]}")
+            # 网络类错误只留一行短消息够了；但代码错误（NameError/TypeError…）必须打完整堆栈，
+            # 否则会被上层 except 吞成一句"推送失败"，很难查（曾因此让一个 NameError 潜伏整轮 CI）。
+            try:
+                net = _is_net_err(e)
+            except Exception:
+                net = False
+            if not net:
+                print("   ↑ 这不是网络问题，是代码错误，完整堆栈如下：")
+                traceback.print_exc()
         finally:
             os.environ.pop("HTTP_PROXY", None)
             os.environ.pop("HTTPS_PROXY", None)

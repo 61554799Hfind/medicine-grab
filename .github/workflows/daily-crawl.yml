@@ -170,8 +170,11 @@ jobs:
           if grep -q "推送成功" crawl.log; then
             echo "Google Sheet 推送成功"
           else
-            echo "::error::Google Sheet 推送失败，请看下方日志尾部"
-            tail -n 20 crawl.log
+            echo "::error::Google Sheet 推送失败"
+            echo "===== crawl.log 里与推送/报错相关的行（最多 30 条）====="
+            grep -nE "推送失败|所有推送方式|Error|Traceback|error|Exception" crawl.log | tail -n 30 || true
+            echo "===== crawl.log 末尾 30 行 ====="
+            tail -n 30 crawl.log
             exit 1
           fi
 
