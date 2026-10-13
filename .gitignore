@@ -1,5 +1,7 @@
 # 敏感文件：绝不能提交到 Git 仓库
 service_account.json
+# 目标表格 ID（仓库要公开，ID 不能写进代码；本机只存在这个文件里）
+sheet_id.txt
 
 # 浏览器配置（体积大且含个人数据）
 browser_profile/

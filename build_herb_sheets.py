@@ -45,6 +45,7 @@ DATA_JSON = os.path.join(BASE_DIR, "history_data.json")
 
 from push_history import (
     SHEET_ID, SERVICE_ACCOUNT_FILE, _run_with_proxy, col_letter,
+    resolve_sheet_id, require_sheet_id,
 )
 
 try:
@@ -582,15 +583,16 @@ def main():
         old = socket.getdefaulttimeout()
         socket.setdefaulttimeout(120)
         try:
+            sid = require_sheet_id()   # 取不到就直接报错，别拿空 ID 去 open_by_key
             creds = Credentials.from_service_account_file(
                 SERVICE_ACCOUNT_FILE,
                 scopes=["https://www.googleapis.com/auth/spreadsheets"])
             client = gspread.authorize(creds)
             try:
-                sh = client.open_by_key(SHEET_ID)
+                sh = client.open_by_key(sid)
             except gspread.SpreadsheetNotFound:
                 raise SystemExit(
-                    f"\n❌ 打不开表格 {SHEET_ID}\n"
+                    f"\n❌ 打不开表格 {sid}\n"
                     f"   原因只有一个：这张表还没共享给服务账号。\n"
                     f"   请把下面这个邮箱加到表格的「共享」里，权限选【编辑者】：\n"
                     f"       {creds.service_account_email}\n")

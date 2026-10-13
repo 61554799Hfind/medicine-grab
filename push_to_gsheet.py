@@ -22,26 +22,31 @@ SERVICE_ACCOUNT_FILE = os.environ.get(
 #   Windows:  set SHEET_ID=1FwyR-...
 #   CI:       仓库 Settings → Secrets → 新增 SHEET_ID
 try:
-    from push_history import SHEET_ID
+    from push_history import SHEET_ID, resolve_sheet_id
 except Exception:  # 单独使用本文件时兜底
-    SHEET_ID = os.environ.get("SHEET_ID", "").strip() or \
-        "***REMOVED***"
+    SHEET_ID = os.environ.get("SHEET_ID", "").strip()
+    resolve_sheet_id = None
+# 注意：这里刻意不写死表格 ID（仓库要公开）。
+# 取不到就留空，真正使用前由 require_sheet_id() 给出明确报错。
 
 # 「历史价格」列（第 12 列 / L）不放链接，留空由 build_herb_sheets.py 统一写入表格内跳转。
 # 原因：以前这里会写死一个 127.0.0.1 的本机网页地址，老板点开必然打不开。
 
 
 def push_data(header, rows, failed_list=None, status_msg=""):
+    sid = require_sheet_id() if resolve_sheet_id else (SHEET_ID or "")
+    if not sid:
+        raise RuntimeError("没找到表格 ID：请建 sheet_id.txt 或设环境变量 SHEET_ID")
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(GSPREAD_TIMEOUT)
     try:
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         client = gspread.authorize(creds)
         try:
-            sh = client.open_by_key(SHEET_ID)
+            sh = client.open_by_key(sid)
         except gspread.SpreadsheetNotFound:
             raise RuntimeError(
-                f"找不到表格 {SHEET_ID}。请确认已把表格「共享」给服务账号 "
+                f"找不到表格 {sid}。请确认已把表格「共享」给服务账号 "
                 f"{creds.service_account_email}（权限设为编辑者）")
         except gspread.exceptions.APIError as e:
             raise RuntimeError(f"Google API 拒绝了请求（多半是没共享表格或 API 未启用）：{e}")

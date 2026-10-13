@@ -51,10 +51,41 @@ def _month_val(vals):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_JSON = os.path.join(BASE_DIR, "history_data.json")
-# 目标表格ID。想换表不用改代码：设环境变量 SHEET_ID 覆盖即可。
+SHEET_ID_FILE = os.path.join(BASE_DIR, "sheet_id.txt")
+
+
+def resolve_sheet_id():
+    """解析目标表格 ID，优先级：环境变量 SHEET_ID > 本地 sheet_id.txt。
+
+    刻意**不在代码里写死 ID**：仓库要公开，写死等于把表格 ID 挂在公网。
+    sheet_id.txt 已在 .gitignore 里，只存在于本机。
+    换表时改 sheet_id.txt 一行即可，或在 CI 里配 Secret SHEET_ID。
+    """
+    v = os.environ.get("SHEET_ID", "").strip()
+    if v:
+        return v
+    try:
+        with open(SHEET_ID_FILE, encoding="utf-8") as f:
+            v = f.read().strip()
+    except OSError:
+        v = ""
+    return v
+
+
+def require_sheet_id():
+    """取表格 ID；取不到就报错退出（避免拿空字符串去调 open_by_key）。"""
+    sid = resolve_sheet_id()
+    if not sid:
+        raise SystemExit(
+            "\n❌ 没找到 Google 表格 ID。二选一：\n"
+            f"  1) 在本机建文件 {SHEET_ID_FILE}，里面只写一行表格 ID\n"
+            "  2) 设环境变量 SHEET_ID（CI 走仓库 Settings → Secrets → SHEET_ID）\n"
+            "  （表格 ID = 浏览器地址栏 /spreadsheets/d/<这一串>/edit 中间那串）\n")
+    return sid
+
+
 # 全项目只有本文件这一处权威定义，push_to_gsheet.py / build_herb_sheets.py 都从这里取值。
-DEFAULT_SHEET_ID = "***REMOVED***"
-SHEET_ID = os.environ.get("SHEET_ID", "").strip() or DEFAULT_SHEET_ID
+SHEET_ID = resolve_sheet_id()
 SERVICE_ACCOUNT_FILE = os.environ.get(
     "SERVICE_ACCOUNT_FILE", os.path.join(BASE_DIR, "service_account.json"))
 LOCAL_PROXY = os.environ.get("LOCAL_PROXY", "http://127.0.0.1:3213")
