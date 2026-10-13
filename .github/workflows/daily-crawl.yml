@@ -58,6 +58,18 @@ jobs:
             echo "::warning::本仓库 secrets 里没有 GSHEET_SA_B64，本次只抓数据、不推送 Google Sheet。"
           fi
 
+      # 表格 ID 已经不再写进代码（仓库公开），CI 必须配 Secret SHEET_ID。
+      # 不配就直接红，别等到最后一步才发现表格没更新。
+      - name: 校验表格 ID 已配置
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          if [ -z "$SHEET_ID" ]; then
+            echo "::error::缺少 Secret SHEET_ID。去 Settings → Secrets and variables → Actions → New repository secret，名称 SHEET_ID，值填表格 ID（浏览器地址栏 /spreadsheets/d/<这串>/edit 中间那串）"
+            exit 1
+          fi
+          echo "已配置 SHEET_ID"
+
       - name: 准备 Python
         uses: actions/setup-python@v5
         with:
