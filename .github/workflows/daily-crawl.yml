@@ -5,6 +5,9 @@ on:
   # 错开整点：整点是 GitHub 负载最高的时候，容易延迟或被丢弃。
   schedule:
     - cron: '17 0 * * *'
+  # ⚠️ 注意：仓库连续 60 天没有任何提交，GitHub 会自动停用定时任务（cron 静默不跑）。
+  # 备份方案：Cloudflare Workers（medicine-trigger）定时打 workflow_dispatch，见 cloudflare-worker-trigger.js。
+  # 另：公开仓库的 Actions 分钟数免费不限量；私有仓库 Free 计划只有 2000 分钟/月。
   # 也允许在 GitHub 网页上手动点一下就跑，方便随时测试
   workflow_dispatch:
 
@@ -76,6 +79,9 @@ jobs:
       - name: 抓取数据并推送
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
+          # 想隐藏表格 ID（比如仓库要公开）时，在仓库 Settings → Secrets 里加一个 SHEET_ID，
+          # 这里就能覆盖代码里的默认值；没配就是空串，代码自动回退到默认值，不影响运行。
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           TZ: Asia/Shanghai
         run: |
           if [ "${{ steps.sa.outputs.ok }}" = "true" ]; then
@@ -105,6 +111,7 @@ jobs:
         if: steps.sa.outputs.ok == 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           TZ: Asia/Shanghai
           GS_RATE_PER_SEC: '0.75'
           CHART_BATCH: '100'
