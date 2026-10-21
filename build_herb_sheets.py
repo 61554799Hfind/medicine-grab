@@ -241,23 +241,67 @@ def plan_pool(combos, raw):
     return pools, offs
 
 
+def add_sheet_once(sh, title, rows, cols):
+    """建表，同样要幂等：502 不代表没执行，重试时会撞 400「already exists」。"""
+    try:
+        return api(sh.add_worksheet, title=title, rows=rows, cols=cols)
+    except Exception as e:
+        if "already exists" not in str(e):
+            raise
+        print(f"  ↻ 表「{title}」已存在（502 后重试所致），直接复用")
+        return api(sh.worksheet, title)
+
+
+def delete_sheets(sh, ids):
+    """批量删表：一个 batchUpdate 只算 1 次写配额（原逐张删 = N 次，是之前 429 的元凶之一）。
+
+    必须幂等，否则必崩：
+      502/503 不代表没执行 —— Google 可能已经把表删了才返回 502；
+      我们的 api() 见到 5xx 会重发，于是去删一张已存在的表 → 400
+      "No sheet with id"，而 400 不在重试名单里 → 整个任务挂掉。
+    所以这里把「表已经没了」视为删除成功，重拉一次现存清单继续删剩下的。
+    """
+    pending = {int(i) for i in ids}
+    if not pending:
+        return
+    for _ in range(6):
+        live = {ws.id for ws in api(sh.worksheets)}
+        todo = sorted(pending & live)
+        if not todo:
+            return                      # 全都不存在了 = 目标已达成
+        try:
+            api(sh.batch_update, {"requests": [
+                {"deleteSheet": {"sheetId": sid}} for sid in todo]})
+            return
+        except Exception as e:
+            if "No sheet with id" not in str(e):
+                raise
+            # 有一部分在 502 那次其实已删掉 → 下一轮重拉清单，只删还活着的
+            print("  ↻ 部分表已不存在（502 后重试所致），刷新清单后继续清理")
+            continue
+    raise RuntimeError(f"仍有 {len(pending)} 张旧表删不掉，请手动清理")
+
+
 def cleanup_old(sh, drop_monthly):
     """删除上一轮留下的卷表/池表/废弃表 —— 保证是覆盖更新，不是叠加"""
     targets = list(DROP_ALWAYS)
     if drop_monthly:
         targets.append("history_monthly")
-    removed = []
-    for ws in list(api(sh.worksheets)):
-        t = ws.title
-        if (t == POOL_NAME or t.startswith(POOL_NAME + "_")
-                or t.startswith(VOL_PREFIX)
-                or t in targets):
-            api(sh.del_worksheet, ws)   # 删除也算写请求，36 张表就是 36 次，必须限速
-            removed.append(t)
-    if removed:
-        print(f"  🧹 已删除上一轮的 {len(removed)} 张表：{'、'.join(removed)}")
-    else:
+    sheets = list(api(sh.worksheets))
+    hit = [ws for ws in sheets
+           if (ws.title == POOL_NAME
+               or ws.title.startswith(POOL_NAME + "_")
+               or ws.title.startswith(VOL_PREFIX)
+               or ws.title in targets)]
+    if not hit:
         print("  🧹 没有需要清理的旧表")
+        return
+    # 安全阀：Google 要求表格至少留 1 张表，绝不能全删
+    if len(hit) == len(sheets):
+        hit = hit[:-1]
+        print("  ⚠️ 待删清单含全部工作表，保留最后一张（Google 不允许空表格）")
+    delete_sheets(sh, [ws.id for ws in hit])
+    print(f"  🧹 已清理上一轮的 {len(hit)} 张表：{'、'.join(ws.title for ws in hit)}")
 
 
 def write_pool(sh, combos, raw, hide=True):
@@ -267,7 +311,7 @@ def write_pool(sh, combos, raw, hide=True):
     for i, keys in enumerate(pools):
         title = POOL_NAME if i == 0 else f"{POOL_NAME}_{i + 1}"
         rows = sum(1 + len(raw[k]) for k in keys) + 2
-        ws = api(sh.add_worksheet, title=title, rows=rows, cols=2)
+        ws = add_sheet_once(sh, title, rows, 2)
         ids.append(ws.id)
 
         buf, base = [], 0
@@ -385,11 +429,21 @@ def build_one_volume(client, sheet_id, v, part, raw, pool_off, pool_ids, n_vol,
     t0 = time.time()
 
     # 1) 建表（卷表已经由 cleanup_old 删干净了，直接新建；建表请求会顺手返回新表的 sheetId）
-    res = api(client.batch_update, sheet_id, {"requests": [{"addSheet": {
-        "properties": {"title": title,
-                       "gridProperties": {"rowCount": 20, "columnCount": VOL_COLS}},
-    }}]})
-    sid = res["replies"][0]["addSheet"]["properties"]["sheetId"]
+    try:
+        res = api(client.batch_update, sheet_id, {"requests": [{"addSheet": {
+            "properties": {"title": title,
+                           "gridProperties": {"rowCount": 20, "columnCount": VOL_COLS}},
+        }}]})
+        sid = res["replies"][0]["addSheet"]["properties"]["sheetId"]
+    except Exception as e:
+        if "already exists" not in str(e):
+            raise
+        # 502 不代表没执行：服务端可能已建好，重试才撞 400 → 直接查出来复用
+        print(f"  ↻ 表「{title}」已存在（502 后重试所致），复用它")
+        meta = api(client.fetch_sheet_metadata, sheet_id,
+                   {"fields": "sheets(properties(sheetId,title))"})
+        sid = next(s["properties"]["sheetId"] for s in meta.get("sheets", [])
+                   if s["properties"]["title"] == title)
 
     # 2) 写区块内容（A1 自带表名，走 sheet_id，线程安全）
     block_area, specs = plan_volume(part, raw, pool_off, pool_ids)
