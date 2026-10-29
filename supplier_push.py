@@ -3,11 +3,8 @@ r"""
 把 supplier_crawl.py 抓到的供应商数据推到 Google 表格（每天全量覆盖）
 
 表格：sheet_id_supplier.txt 里那一份（工作簿名「供应商_ytw」）
-    · 工作表「供应商」
-        第 1 行  标题：数据日期 + 总条数 + 覆盖品名数
-        第 2 行  表头
-        第 3 行起 明细（按品名 / 发布日期倒序，带筛选器）
-    · 工作表「供应商汇总」  —— 每味药材的供应商数 / 报价条数 / 最新发布日期 / 主要货源地
+    · 工作表「供应商」        —— 全量明细，第 1 行表头，带筛选器
+    · 工作表「供应商汇总」    —— 每味药材的供应商数 / 报价条数 / 最新发布日期 / 主要货源地
 
 设计要点
 ------------------------------------------------------------------
@@ -15,9 +12,10 @@ r"""
 2. **先解除合并**：原表 A 列有过合并单元格（clear 不会解除合并，
    只有左上角保留值，其余读出来是空），所以写入前强制 unmerge 整表。
    本表全程不合并单元格。
-3. **RAW 写入**：手机号保持文本（不会被转数字 / 科学计数），
+3. **普通表格，不加底色**：只做「冻结表头 + 表头加粗 + 筛选器 + 列宽」。
+4. **RAW 写入**：手机号保持文本（不会被转数字 / 科学计数），
    日期是 ISO 文本，A→Z 排序等价于按时间排序。
-4. **配额**：分批 5000 行，一次全量约 10 次请求（限额 60/分钟）。
+5. **配额**：分批 5000 行，一次全量约 10 次请求（限额 60/分钟）。
 
 用法
 ------------------------------------------------------------------
@@ -40,15 +38,13 @@ SHEET_ID_FILE = os.path.join(BASE_DIR, "sheet_id_supplier.txt")
 
 MAIN_SHEET = "供应商"
 SUM_SHEET = "供应商汇总"
-# CSV 第一列是「更新时间」（全表同一天，写进表格纯属噪音，落表时丢掉，改放标题行）
+# CSV 第一列是「更新时间」（全表同一天），落表时从首位移到最后一列，方便看数据新旧
 CSV_DATE_COL = "更新时间"
 HEADER = ["品名", "规格", "产地", "货源所在地", "单价",
-          "数量", "联系人", "手机", "供货说明", "发布日期", "剩余天数", "实名认证"]
+          "数量", "联系人", "手机", "供货说明", "发布日期", "剩余天数", "实名认证", "更新日期"]
 SUM_HEADER = ["品名", "供应商数", "报价条数", "最新发布日期", "主要货源所在地"]
 BATCH = 5000
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-BROWN = {"red": 0.36, "green": 0.24, "blue": 0.14}
-WHITE = {"red": 1, "green": 1, "blue": 1}
 
 
 def log(msg=""):
@@ -122,14 +118,16 @@ def main():
         rd = csv.reader(f)
         header = next(rd, None) or []
         rows = [r for r in rd if r and any(c.strip() for c in r)]
-    # 丢掉「更新时间」列（全表同一天，改放标题行）
+    day = time.strftime("%Y-%m-%d")
+    # 「更新时间」从首列挪到末列（每行都补上当天日期，全表同值但一眼能看出数据是哪天的）
     if header and header[0] == CSV_DATE_COL:
         header = header[1:]
         rows = [r[1:] for r in rows]
-    log(f"读到 {len(rows)} 行 × {len(header)} 列")
+    rows = [r + [day] for r in rows]
+    header = (header or HEADER[:-1]) + ["更新日期"]
+    log(f"读到 {len(rows)} 行 × {len(header)} 列，数据日期 {day}")
     if header != HEADER:
-        log(f"⚠️ CSV 表头与预期不一致，按 CSV 实际表头写入：{header}")
-        header = header or HEADER
+        log(f"⚠️ CSV 表头与预期不一致：{header}")
 
     summary = build_summary(rows)
     log(f"覆盖 {len(summary)} 个品名；供应商数 Top5："
@@ -149,9 +147,7 @@ def main():
             "→ 请在 Google 表格里点「共享」，把这个邮箱加成「编辑者」。")
     log(f"打开表格「{sh.title}」")
 
-    day = time.strftime("%Y-%m-%d")
     ncol = len(header)
-    title = f"药通网供货信息 · 数据日期 {day} · 共 {len(rows)} 条报价 / {len(summary)} 个品名"
 
     # ---------- 主表：全量覆盖 ----------
     ws = ensure_sheet(sh, MAIN_SHEET, len(rows) + 100, ncol)
@@ -160,80 +156,50 @@ def main():
     sh.batch_update({"requests": [{"unmergeCells": {"range": {"sheetId": ws.id}}}]})
     ws.clear()
     log("已解除合并 + 清空旧数据，开始写入 …")
-    ws.update([[title]], "A1", value_input_option="RAW")
-    ws.update([header], "A2", value_input_option="RAW")
+    ws.update([header], "A1", value_input_option="RAW")
     written = 0
     for i in range(0, len(rows), BATCH):
         chunk = rows[i:i + BATCH]
-        ws.update(chunk, f"A{i + 3}", value_input_option="RAW")
+        ws.update(chunk, f"A{i + 2}", value_input_option="RAW")
         written += len(chunk)
         log(f"  写入 {written}/{len(rows)} 行")
     log(f"主表完成：{written} 行，用时 {time.time()-t0:.0f}s")
 
     # ---------- 汇总表 ----------
     ws2 = ensure_sheet(sh, SUM_SHEET, len(summary) + 50, len(SUM_HEADER))
-    stitle = f"供应商数量汇总 · 数据日期 {day}"
     ws2.clear()
-    ws2.update([[stitle]], "A1", value_input_option="RAW")
-    ws2.update([SUM_HEADER] + summary, "A2", value_input_option="RAW")
+    sh.batch_update({"requests": [{"unmergeCells": {"range": {"sheetId": ws2.id}}}]})
+    ws2.update([SUM_HEADER] + summary, "A1", value_input_option="RAW")
     log(f"汇总表完成：{len(summary)} 行")
 
-    # ---------- 格式（一次 batchUpdate 搞定，省配额） ----------
-    hdr_fmt = {
-        "backgroundColor": BROWN,
-        "textFormat": {"bold": True, "foregroundColor": WHITE},
-        "horizontalAlignment": "CENTER",
-    }
+    # ---------- 格式：先清空所有自定义格式，再加「冻结表头 + 表头加粗 + 筛选器 + 列宽」 ----------
+    # updateCells + fields=userEnteredFormat 会把单元格回到 Google 默认样式（去掉底色/字号等）
+    bold = {"textFormat": {"bold": True}}
+    reset = [
+        {"updateCells": {"range": {"sheetId": ws.id}, "fields": "userEnteredFormat"}},
+        {"updateCells": {"range": {"sheetId": ws2.id}, "fields": "userEnteredFormat"}},
+    ]
     reqs = [
-        # 解除合并后重新合并标题行
-        {"mergeCells": {"range": {
-            "sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
-            "startColumnIndex": 0, "endColumnIndex": ncol}, "mergeType": "MERGE_ALL"}},
-        {"mergeCells": {"range": {
-            "sheetId": ws2.id, "startRowIndex": 0, "endRowIndex": 1,
-            "startColumnIndex": 0, "endColumnIndex": len(SUM_HEADER)}, "mergeType": "MERGE_ALL"}},
-        # 标题行样式
         {"repeatCell": {
             "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1},
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": {"red": 0.94, "green": 0.90, "blue": 0.84},
-                "textFormat": {"bold": True, "fontSize": 11,
-                               "foregroundColor": {"red": 0.36, "green": 0.24, "blue": 0.14}},
-                "horizontalAlignment": "LEFT", "verticalAlignment": "MIDDLE"}},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"}},
+            "cell": {"userEnteredFormat": bold}, "fields": "userEnteredFormat.textFormat"}},
         {"repeatCell": {
             "range": {"sheetId": ws2.id, "startRowIndex": 0, "endRowIndex": 1},
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": {"red": 0.94, "green": 0.90, "blue": 0.84},
-                "textFormat": {"bold": True, "fontSize": 11,
-                               "foregroundColor": {"red": 0.36, "green": 0.24, "blue": 0.14}},
-                "horizontalAlignment": "LEFT", "verticalAlignment": "MIDDLE"}},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment)"}},
-        # 表头样式（第 2 行）
-        {"repeatCell": {
-            "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": 2},
-            "cell": {"userEnteredFormat": hdr_fmt},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"}},
-        {"repeatCell": {
-            "range": {"sheetId": ws2.id, "startRowIndex": 1, "endRowIndex": 2},
-            "cell": {"userEnteredFormat": hdr_fmt},
-            "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"}},
-        # 冻结前两行（标题 + 表头）
+            "cell": {"userEnteredFormat": bold}, "fields": "userEnteredFormat.textFormat"}},
         {"updateSheetProperties": {"properties": {
-            "sheetId": ws.id, "gridProperties": {"frozenRowCount": 2}},
+            "sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}},
             "fields": "gridProperties.frozenRowCount"}},
         {"updateSheetProperties": {"properties": {
-            "sheetId": ws2.id, "gridProperties": {"frozenRowCount": 2}},
+            "sheetId": ws2.id, "gridProperties": {"frozenRowCount": 1}},
             "fields": "gridProperties.frozenRowCount"}},
-        # 筛选器：从表头行开始
         {"setBasicFilter": {"filter": {"range": {
-            "sheetId": ws.id, "startRowIndex": 1, "endRowIndex": len(rows) + 2,
+            "sheetId": ws.id, "startRowIndex": 0, "endRowIndex": len(rows) + 1,
             "startColumnIndex": 0, "endColumnIndex": ncol}}}},
         {"setBasicFilter": {"filter": {"range": {
-            "sheetId": ws2.id, "startRowIndex": 1, "endRowIndex": len(summary) + 2,
+            "sheetId": ws2.id, "startRowIndex": 0, "endRowIndex": len(summary) + 1,
             "startColumnIndex": 0, "endColumnIndex": len(SUM_HEADER)}}}},
     ]
-    # 列宽：供货说明、手机、货源所在地给足
+    # 列宽：供货说明、手机、货源所在地给足（只调宽度，不动颜色）
     widths = {"供货说明": 300, "手机": 110, "货源所在地": 90, "品名": 90}
     for col, px in widths.items():
         if col in header:
@@ -243,8 +209,8 @@ def main():
                           "startIndex": idx, "endIndex": idx + 1},
                 "properties": {"pixelSize": px}, "fields": "pixelSize"}})
     try:
-        sh.batch_update({"requests": reqs})
-        log("格式设置完成（标题 / 表头配色 / 冻结两行 / 筛选器 / 列宽）")
+        sh.batch_update({"requests": reset + reqs})
+        log("格式完成（清空旧格式 → 冻结表头 / 表头加粗 / 筛选器 / 列宽；无底色）")
     except Exception as e:
         log(f"⚠️ 格式设置失败（数据已写入，不影响内容）：{type(e).__name__}: {e}")
 
