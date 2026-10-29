@@ -1,0 +1,124 @@
+name: 每日供应商抓取
+
+# 独立任务，不和「每日药材价格抓取」耦合：
+#   · 主业跑挂了不影响供应商表更新，反之亦然
+#   · 供应商任务只需 requests + gspread，不用装 Playwright，启动快
+on:
+  # 北京时间 09:40（UTC 01:40）。错开主业 08:17 那一轮，避免同时打药通网。
+  schedule:
+    - cron: '40 1 * * *'
+  # ⚠️ 仓库连续 60 天无提交，GitHub 会自动停用 cron（静默不跑），
+  #    备份方案：Cloudflare Workers 定时打 workflow_dispatch。
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: '只抓前 N 味（测试用，留空=全量）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+# ⚠️ concurrency 只在这一处定义，不要同时在 job 上写同名 group，
+#    否则会报 "a deadlock was detected for concurrency group" 直接被取消。
+concurrency:
+  group: medicine-supplier-crawl
+  cancel-in-progress: false
+
+jobs:
+  supplier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # ⚠️ 必须有：GitHub 把 stdout 当管道，Python 默认块缓冲（攒满 8KB 才输出），
+    #    长循环脚本看起来像卡死。
+    env:
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # secrets 不能写进 if: 条件，也不能内联进 run 脚本，只能先落成 step outputs。
+      - name: 检查密钥与表格 ID
+        id: cfg
+        env:
+          GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
+          SHEET_ID_SUPPLIER: ${{ secrets.SHEET_ID_SUPPLIER }}
+        run: |
+          [ -n "$GSHEET_SA_B64" ] && echo "sa=true" >> "$GITHUB_OUTPUT" || echo "sa=false" >> "$GITHUB_OUTPUT"
+          [ -n "$SHEET_ID_SUPPLIER" ] && echo "sid=true" >> "$GITHUB_OUTPUT" || echo "sid=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$GSHEET_SA_B64" ]; then
+            echo "::error::缺少 Secret GSHEET_SA_B64（Google 服务账号密钥），无法写表"
+            exit 1
+          fi
+          if [ -z "$SHEET_ID_SUPPLIER" ]; then
+            echo "::error::缺少 Secret SHEET_ID_SUPPLIER。去 Settings → Secrets and variables → Actions → New repository secret，名称 SHEET_ID_SUPPLIER，值填供应商表格 ID（地址栏 /spreadsheets/d/<这串>/edit 中间那串）"
+            exit 1
+          fi
+          echo "密钥与表格 ID 均已配置"
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth
+
+      # Secret 里贴 base64 串或 JSON 原文都能用；自动清掉 Windows 复制带进来的 \r
+      # （Out-File 生成的是 CRLF，会让 base64 -d 报 invalid input）。
+      - name: 还原 Google 服务账号密钥
+        env:
+          GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
+        run: |
+          RAW="$GSHEET_SA_B64"
+          STRIP=$(printf '%s' "$RAW" | tr -d '[:space:]')
+          if [ "${STRIP:0:1}" = "{" ]; then
+            printf '%s' "$RAW" > service_account.json
+          else
+            if ! printf '%s' "$STRIP" | base64 -d > service_account.json 2>/dev/null; then
+              echo "::error::GSHEET_SA_B64 既不是 JSON 也不是合法 base64（长度 ${#STRIP}，开头 ${STRIP:0:16}）"
+              exit 1
+            fi
+          fi
+          python -c "import json;d=json.load(open('service_account.json',encoding='utf-8'));assert d.get('type')=='service_account';assert 'private_key' in d;print('密钥校验通过:',d.get('client_email'),'| key_id =',d.get('private_key_id'))"
+
+      - name: 抓取供货信息
+        env:
+          TZ: Asia/Shanghai
+          LIMIT: ${{ github.event.inputs.limit }}
+        run: |
+          if [ -n "$LIMIT" ]; then
+            python supplier_crawl.py --limit "$LIMIT"
+          else
+            python supplier_crawl.py
+          fi
+
+      - name: 推送 Google 表格（全量覆盖）
+        env:
+          TZ: Asia/Shanghai
+          SHEET_ID_SUPPLIER: ${{ secrets.SHEET_ID_SUPPLIER }}
+        run: python supplier_push.py
+
+      # 数据太少说明大概率被站点拦了，别让任务绿着骗人
+      - name: 结果自检
+        run: |
+          lines=$(wc -l < supplier_data.csv)
+          echo "supplier_data.csv 行数（含表头）：$lines"
+          if [ "$lines" -lt 50 ]; then
+            echo "::error::结果异常少（$lines 行），大概率被站点拦截"
+            exit 1
+          fi
+
+      - name: 保存结果文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 供应商数据-${{ github.run_number }}
+          retention-days: 14
+          path: |
+            supplier_data.csv
+            supplier_failed.txt

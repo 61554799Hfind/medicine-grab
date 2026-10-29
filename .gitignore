@@ -2,6 +2,7 @@
 service_account.json
 # 目标表格 ID（仓库要公开，ID 不能写进代码；本机只存在这个文件里）
 sheet_id.txt
+sheet_id_supplier.txt
 
 # 浏览器配置（体积大且含个人数据）
 browser_profile/
@@ -18,6 +19,11 @@ failed_medicines.txt
 history_data.json
 history_progress.json
 history_crawl.log
+
+# 供应商抓取产物（数据量大，CI 会重新生成）
+supplier_data.json
+supplier_data.csv
+supplier_failed.txt
 
 # 编辑器与本地工作数据
 .idea/
