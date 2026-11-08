@@ -1,3 +1,27 @@
+# -*- coding: utf-8 -*-
+r"""
+把 supplier_crawl.py 抓到的供应商数据推到 Google 表格（每天全量覆盖）
+
+表格：sheet_id_supplier.txt 里那一份（工作簿名「供应商_ytw」）
+    · 工作表「供应商」        —— 全量明细，第 1 行表头，带筛选器
+    · 工作表「供应商汇总」    —— 每味药材的供应商数 / 报价条数 / 最新发布日期 / 主要货源地
+
+设计要点
+------------------------------------------------------------------
+1. **每天全量覆盖**：先 clear() 再写，行数变少也不会留旧数据。
+2. **先解除合并**：原表 A 列有过合并单元格（clear 不会解除合并，
+   只有左上角保留值，其余读出来是空），所以写入前强制 unmerge 整表。
+   本表全程不合并单元格。
+3. **普通表格，不加底色**：只做「冻结表头 + 表头加粗 + 筛选器 + 列宽」。
+4. **RAW 写入**：手机号保持文本（不会被转数字 / 科学计数），
+   日期是 ISO 文本，A→Z 排序等价于按时间排序。
+5. **配额**：分批 5000 行，一次全量约 10 次请求（限额 60/分钟）。
+
+用法
+------------------------------------------------------------------
+    .venv\\Scripts\\python.exe supplier_push.py            # 用 supplier_data.csv
+    .venv\\Scripts\\python.exe supplier_push.py --dry-run  # 只看统计不写表
+"""
 import argparse
 import collections
 import csv
@@ -14,6 +38,7 @@ SHEET_ID_FILE = os.path.join(BASE_DIR, "sheet_id_supplier.txt")
 
 MAIN_SHEET = "供应商"
 SUM_SHEET = "供应商汇总"
+# CSV 第一列是「更新时间」（全表同一天），落表时从首位移到最后一列，方便看数据新旧
 CSV_DATE_COL = "更新时间"
 HEADER = ["品名", "规格", "产地", "货源所在地", "单价",
           "数量", "联系人", "手机", "供货说明", "发布日期", "剩余天数", "实名认证", "更新日期"]
@@ -38,6 +63,7 @@ def require_sheet_id():
 
 
 def connect():
+    # 本机开着 VPN 时，系统代理变量会让请求绕远路；直连更快
     if not os.environ.get("SUPPLIER_KEEP_PROXY"):
         for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             os.environ.pop(k, None)
@@ -46,6 +72,7 @@ def connect():
 
 
 def ensure_sheet(sh, title, rows, cols):
+    """拿工作表；不存在就建；行数不够就扩容。"""
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -92,12 +119,19 @@ def main():
         header = next(rd, None) or []
         rows = [r for r in rd if r and any(c.strip() for c in r)]
     day = time.strftime("%Y-%m-%d")
+    # 「更新时间」从首列挪到末列。用 CSV 里记录的真实抓取日（不是推送日）：
+    # 本机可能今天抓、明天才推，写推送日会让老板误判数据新旧。
     if header and header[0] == CSV_DATE_COL:
+        catch_days = [(r[0] or day) for r in rows]
         header = header[1:]
         rows = [r[1:] for r in rows]
-    rows = [r + [day] for r in rows]
+    else:
+        catch_days = [day] * len(rows)
+    rows = [r + [d] for r, d in zip(rows, catch_days)]
     header = (header or HEADER[:-1]) + ["更新日期"]
-    log(f"读到 {len(rows)} 行 × {len(header)} 列，数据日期 {day}")
+    real_days = sorted(set(catch_days))
+    shown = real_days[0] if len(real_days) == 1 else f"{real_days[0]} ~ {real_days[-1]}"
+    log(f"读到 {len(rows)} 行 × {len(header)} 列，数据抓取日 {shown}")
     if header != HEADER:
         log(f"⚠️ CSV 表头与预期不一致：{header}")
 
@@ -144,6 +178,8 @@ def main():
     ws2.update([SUM_HEADER] + summary, "A1", value_input_option="RAW")
     log(f"汇总表完成：{len(summary)} 行")
 
+    # ---------- 格式：先清空所有自定义格式，再加「冻结表头 + 表头加粗 + 筛选器 + 列宽」 ----------
+    # updateCells + fields=userEnteredFormat 会把单元格回到 Google 默认样式（去掉底色/字号等）
     bold = {"textFormat": {"bold": True}}
     reset = [
         {"updateCells": {"range": {"sheetId": ws.id}, "fields": "userEnteredFormat"}},
