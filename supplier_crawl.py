@@ -92,7 +92,6 @@ class SupplierCrawler:
     def __init__(self, gap=BASE_GAP):
         self.gap = gap
         self.sess = requests.Session()
-        # ⚠️ 绝不能读系统代理：VPN 开着时系统代理会让药通网超时
         self.sess.trust_env = False
         self.sess.headers.update({
             "User-Agent": UA,
@@ -133,7 +132,6 @@ class SupplierCrawler:
                     self.gap = min(self.gap * 1.8, 3.0)
                     log(f"  ⏳ {last}，放慢到 {self.gap:.2f}s")
                     continue
-                # 成功一次就慢慢提速回去
                 self.gap = max(BASE_GAP, self.gap * 0.95)
                 self.stats["ok"] += 1
                 return j
@@ -158,7 +156,6 @@ class SupplierCrawler:
                 break
             for d in data:
                 gqid = str(d.get("gqid") or "").strip()
-                # 接口偶尔会把相似品名也带出来，只保留精确匹配
                 if clean(d.get("ycnam")) != name:
                     continue
                 key = gqid or f"{d.get('mob')}|{d.get('dtm')}|{d.get('addr')}"
@@ -172,11 +169,6 @@ class SupplierCrawler:
 
 
 def load_names(limit=None, only=None):
-    """品名清单：优先 --names，否则合并 medicine_list.txt + 种子 CSV（去重保序）。
-
-    medicine_list.txt 是 971 味全集；药材涨落对比结果.csv 可能只是某次试跑的子集，
-    所以两份都读，以 medicine_list.txt 的顺序为准，CSV 里多出来的追加在后面。
-    """
     if only:
         return [n.strip() for n in only.split(",") if n.strip()]
     names, seen = [], set()
@@ -217,7 +209,6 @@ def to_row(d, today):
 
 
 def is_fresh(d, max_age_days=MAX_AGE_DAYS):
-    """发布日期在 max_age_days 天内才算有效；日期解析不了就保留。"""
     raw = clean(d.get("dtm"))
     try:
         dt = time.strptime(raw, "%Y-%m-%d")
@@ -262,7 +253,6 @@ def main():
         except Exception as e:
             failed.append(name)
             log(f"[{i}/{len(names)}] ❌ {name} 失败：{e}")
-        # 每 20 个品名落一次盘，防止中途崩掉全丢
         if i % 20 == 0:
             with open(CACHE_JSON, "w", encoding="utf-8") as f:
                 json.dump(cache, f, ensure_ascii=False)
@@ -281,7 +271,7 @@ def main():
                 kept = [d for d in recs if is_fresh(d, args.max_age_days)]
                 dropped += len(recs) - len(kept)
                 recs = kept
-            # 新发布的排前面，老板打开就看到有效供应商
+            # 新发布的排前面
             recs.sort(key=lambda d: clean(d.get("dtm")), reverse=True)
             for d in recs:
                 w.writerow(to_row(d, today))
