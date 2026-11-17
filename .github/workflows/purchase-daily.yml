@@ -102,6 +102,12 @@ jobs:
               exit 1
             fi
           done
+          # 康美电话要登录才有；出现「登录后可见」说明 KM_USER/KM_PASS 没配或登录被拒
+          if grep -q "登录后可见" purchase_km.csv; then
+            echo "::warning::康美联系电话仍是「登录后可见」——检查 Secret KM_USER / KM_PASS，或账号是否被锁"
+          else
+            echo "康美电话列正常，带号码 $(grep -c '^[^,]' purchase_km.csv) 行左右"
+          fi
 
       - name: 保存结果文件
         if: always()
