@@ -28,6 +28,13 @@ workflow 里 cron 写的是 UTC 00:05 / 00:17，对应北京时间 08:05 / 08:17
 二、要做的事（两件，约 5 分钟）
 ============================================================
 
+【第 0 件】控制台在哪里
+  网址：https://dash.cloudflare.com
+  · 用当初注册 Cloudflare 的邮箱 + 密码登录（这个账号之前建过 medicine-trigger，不是新注册）
+  · 忘了密码：登录页点「Forgot your password?」→ 邮箱收重置链接
+  · 登录后先看左侧菜单，新版界面叫「Compute (Workers)」，旧版直接叫「Workers & Pages」，
+    两种点进去都是同一个 Worker 列表，里面能看到 medicine-trigger
+
 【第 1 件】把 Worker 代码换掉
   1. Cloudflare 控制台 → Workers & Pages → 点你的 medicine-trigger
   2. 右上「编辑代码」（Edit code）
