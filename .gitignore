@@ -31,6 +31,8 @@ purchase_data.json
 # 例外：康美在海外 runner 上连不通（443 ConnectTimeout），CI 抓不到，
 # 只能由本机抓好后提交进仓库给 CI 推送用 —— 这一份必须进仓库。
 !purchase_km.csv
+# 同理：康美「供货」（供应商）也由阿里云函数抓好后提交回仓库
+!supplier_km.csv
 
 # 本机部署说明（里面有康美账号密码）和函数代码包 —— 仓库是公开的，绝不提交
 阿里云部署步骤.txt
@@ -49,3 +51,5 @@ __pycache__/
 _*
 zz*
 zzz*
+probefile.txt
+commit_*.txt

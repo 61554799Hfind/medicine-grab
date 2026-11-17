@@ -38,6 +38,7 @@ import urllib.request
 
 HOST = "https://www.kmb2b.com"
 LIST_URL = HOST + "/statichtml/purchase/index.html"
+SUPPLY_URL = HOST + "/supplyInfo/supplyInfo_supplyInfoListHtml.action"
 LOGIN_PAGE = HOST + "/html/loginPage.htm"
 LOGIN_API = HOST + "/ajaxJson/unionLogin.action"
 
@@ -48,13 +49,19 @@ HEADER = ["品名", "规格", "产地", "数量", "联系电话", "联系人",
           "剩余天数", "有效期", "仓储所在地", "质量要求", "包装要求",
           "资质要求", "认证信息", "会员类型", "经营所在地", "详情链接", "更新日期"]
 
+# 供货（供应商）用的 13 列，和药通网 supplier_data.csv 完全一致
+SUPPLY_HEADER = ["更新时间", "品名", "规格", "产地", "货源所在地", "单价",
+                 "数量", "联系人", "手机", "供货说明", "发布日期", "剩余天数", "实名认证"]
+
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"[\s\u00a0\u3000]+")
 
 # FC 的 /code 目录只读，可写的只有 /tmp；本机测试就写在脚本旁边
+_LOCAL = os.path.dirname(os.path.abspath(__file__))
 OUT_CSV = ("/tmp/purchase_km.csv" if os.name != "nt"
-           else os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "purchase_km_fc.csv"))
+           else os.path.join(_LOCAL, "purchase_km_fc.csv"))
+OUT_SUPPLY = ("/tmp/supplier_km.csv" if os.name != "nt"
+              else os.path.join(_LOCAL, "supplier_km_fc.csv"))
 
 
 def log(msg=""):
@@ -207,6 +214,91 @@ def fetch_rows(c, with_detail=True):
     return rows
 
 
+def fetch_supply_rows(c, max_pages=None, gap=0.2):
+    """康美「供货信息」列表（供应商）。上架时间倒序，20 条/页，约 249 页 ≈ 4960 条。
+
+    卡片结构（div.goods-item）：
+        .title-selling-point → 品名        .spec-config → "规格/产地"
+        .place-info          → 货源所在地   .price-box   → 数量
+        .tel-box             → 电话（不登录是「登录后可见」）
+    这个站供货列表没有 单价/发布时间/剩余天数/供货说明 → 对应列留空，不编。
+    联系人只在详情页，全量要多 5000 次请求，放弃（手机号已经够联系）。
+    """
+    rows, seen = [], set()
+    page, empty = 1, 0
+    while True:
+        if max_pages and page > max_pages:
+            break
+        url = SUPPLY_URL + "?" + urllib.parse.urlencode(
+            {"page": page, "viewSupplyInfo.byTimeDesc": "true"})
+        try:
+            status, body = c.get(url, timeout=45)
+        except Exception as e:
+            log(f"    供货第 {page} 页失败：{type(e).__name__}，停止翻页")
+            break
+        html = decode(body)
+        parts = html.split('<div class="goods-item">')[1:]
+        if not parts:
+            # 康美偶尔返回空白页，连续两次才认为到底
+            if empty >= 1:
+                break
+            empty += 1
+            page += 1
+            continue
+        empty = 0
+        new = 0
+        for p in parts:
+            blk = p[:2600]
+
+            def one(pat):
+                m = re.search(pat, blk, re.S)
+                return m.group(1) if m else ""
+
+            name = clean(one(r'class="title-selling-point">(.*?)<'))
+            if not name:
+                continue
+            detail_url = one(r'href="(https://www\.kmb2b\.com/statichtml/supply/info-\d+\.html)"')
+            sid = (re.search(r"info-(\d+)", detail_url).group(1)
+                   if detail_url else name)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            spec_raw = clean(one(r'class="spec-config">(.*?)</div>'))
+            if "/" in spec_raw:
+                spec, origin = spec_raw.rsplit("/", 1)
+            else:
+                spec, origin = spec_raw, ""
+            tel = clean(one(r'class="tel-box">(.*?)</div>')).replace("电话：", "").strip()
+            rows.append({
+                "品名": name,
+                "规格": spec.strip(),
+                "产地": origin.strip(),
+                "货源所在地": clean(one(r'class="place-info">(.*?)</div>')),
+                "单价": "",
+                "数量": clean(one(r'class="price-box">(.*?)</div>')),
+                "联系人": "",
+                "手机": "" if tel == "登录后可见" else tel,
+                "供货说明": "",
+                "发布日期": "",
+                "剩余天数": "",
+                "实名认证": "已认证" if 'class="res-tag' in blk else "",
+            })
+            new += 1
+        if new == 0:
+            break
+        if page % 25 == 0:
+            log(f"    供货 {page} 页 / {len(rows)} 条")
+        page += 1
+        time.sleep(gap)
+    today = time.strftime("%Y-%m-%d")
+    for r in rows:
+        r["更新时间"] = today
+    # 按品名分组，观感和药通网那张表一致
+    rows.sort(key=lambda r: r["品名"])
+    log(f"  康美供货 {len(rows)} 条（{page - 1} 页）")
+    return rows
+
+
 def gh_request(method, url, token, payload=None, timeout=30):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -220,13 +312,12 @@ def gh_request(method, url, token, payload=None, timeout=30):
         return r.status, json.loads(r.read().decode() or "{}")
 
 
-def commit_csv(csv_bytes, message):
+def commit_csv(csv_bytes, message, path="purchase_km.csv"):
     """把 CSV 提交到仓库（GitHub Contents API，文件小，一次 PUT 搞定）。"""
     import base64
     repo = os.environ.get("GH_REPO", "61554799Hfind/medicine-grab").strip()
     branch = os.environ.get("GH_BRANCH", "main").strip()
     token = os.environ.get("GH_TOKEN", "").strip()
-    path = "purchase_km.csv"
     if not token:
         raise RuntimeError("没配 GH_TOKEN，无法提交到仓库")
     api = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -278,10 +369,36 @@ def run(dry_run=False):
         f.write(data)
 
     phones = sum(1 for r in rows if r["联系电话"] and r["联系电话"] != "登录后可见")
-    msg = f"{len(rows)} 条，电话可见 {phones} 条"
-    if dry_run or os.environ.get("DRY_RUN", "").strip() == "1":
+    msg = f"需求 {len(rows)} 条（电话可见 {phones}）"
+    dry = dry_run or os.environ.get("DRY_RUN", "").strip() == "1"
+
+    # ---------- 供货（供应商），可选：SUPPLY=0 可关掉 ----------
+    supply_data, supply_n, supply_phones = None, 0, 0
+    if os.environ.get("SUPPLY", "1").strip() != "0":
+        try:
+            srows = fetch_supply_rows(c)
+            if srows:
+                sbuf = io.StringIO()
+                sw = csv.DictWriter(sbuf, fieldnames=SUPPLY_HEADER, extrasaction="ignore")
+                sw.writeheader()
+                sw.writerows(srows)
+                supply_data = sbuf.getvalue().encode("utf-8-sig")
+                with open(OUT_SUPPLY, "wb") as f:
+                    f.write(supply_data)
+                supply_n = len(srows)
+                supply_phones = sum(1 for r in srows if r["手机"])
+                msg += f"；供货 {supply_n} 条（电话可见 {supply_phones}）"
+        except Exception as e:
+            # 供货失败不影响需求提交
+            log(f"  ⚠️ 供货抓取失败：{type(e).__name__}: {e}")
+            msg += "；供货抓取失败（需求已正常保存）"
+
+    if dry:
         return {"ok": True, "msg": msg + "（演练，未提交）"}
     msg += "；" + commit_csv(data, f"康美需求自动更新 {rows[0]['更新日期']}")
+    if supply_data:
+        msg += "；" + commit_csv(
+            supply_data, f"康美供货自动更新 {time.strftime('%Y-%m-%d')}", "supplier_km.csv")
     return {"ok": True, "msg": msg}
 
 

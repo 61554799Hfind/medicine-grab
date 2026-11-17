@@ -60,7 +60,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install requests gspread google-auth
+          pip install requests gspread google-auth cryptography
 
       - name: 还原 Google 服务账号密钥
         env:
@@ -78,7 +78,7 @@ jobs:
           fi
           python -c "import json;d=json.load(open('service_account.json',encoding='utf-8'));assert d.get('type')=='service_account';assert 'private_key' in d;print('密钥校验通过:',d.get('client_email'),'| key_id =',d.get('private_key_id'))"
 
-      - name: 抓取供货信息
+      - name: 抓取药通网供货信息
         env:
           TZ: Asia/Shanghai
           LIMIT: ${{ github.event.inputs.limit }}
@@ -89,20 +89,48 @@ jobs:
             python supplier_crawl.py
           fi
 
-      - name: 推送 Google 表格（全量覆盖）
+      # 康美在海外 runner 上连不通（443 直接丢包），所以康美那份 CSV 由阿里云函数
+      # 每天 07:40 抓好提交回仓库，这一步只用仓库里的 supplier_km.csv，不重抓。
+      - name: 抓取中香网供货信息
+        env:
+          TZ: Asia/Shanghai
+        run: |
+          python supplier_extra_crawl.py --only zx || {
+            echo "::warning title=中香网抓取失败::供货数据保留仓库里上一份"
+          }
+
+      - name: 推送 Google 表格（三站全量覆盖）
         env:
           TZ: Asia/Shanghai
           SHEET_ID_SUPPLIER: ${{ secrets.SHEET_ID_SUPPLIER }}
-        run: python supplier_push.py
+        run: python supplier_multi_push.py
 
       - name: 结果自检
         run: |
           lines=$(wc -l < supplier_data.csv)
-          echo "supplier_data.csv 行数（含表头）：$lines"
+          echo "药通网 supplier_data.csv 行数（含表头）：$lines"
           if [ "$lines" -lt 50 ]; then
             echo "::error::结果异常少（$lines 行），大概率被站点拦截"
             exit 1
           fi
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import csv, os
+          print("\n### 供应商各站数据\n")
+          print("| 工作表 | 行数 | 更新日期 |")
+          print("|---|---|---|")
+          for tab, fn in (("药通网", "supplier_data.csv"),
+                          ("康美", "supplier_km.csv"),
+                          ("中香", "supplier_zx.csv")):
+              if not os.path.exists(fn):
+                  print(f"| {tab} | 跳过（文件缺失，表里保留上一份） | - |")
+                  continue
+              with open(fn, encoding="utf-8-sig") as f:
+                  rows = list(csv.DictReader(f))
+              d = rows[0].get("更新时间", "?") if rows else "-"
+              print(f"| {tab} | {len(rows)} | {d} |")
+          print()
+          print("康美那份由阿里云函数每早 07:40 抓取提交；日期不是今天说明函数没跑成功。")
+          PY
 
       - name: 保存结果文件
         if: always()
@@ -112,4 +140,6 @@ jobs:
           retention-days: 14
           path: |
             supplier_data.csv
+            supplier_km.csv
+            supplier_zx.csv
             supplier_failed.txt
