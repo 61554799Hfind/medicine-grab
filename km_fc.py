@@ -18,6 +18,9 @@
     GH_REPO    仓库全名，默认 61554799Hfind/medicine-grab
     GH_BRANCH  分支，默认 main
     DRY_RUN    设 1 则只抓不提交（第一次测试用）
+    SUPPLY     设 0 则只抓需求、不抓供货（默认 1，两类都抓）
+
+注意：供货 249 页，函数「执行超时时间」必须 ≥600 秒，否则供货抓不完。
 
 本地测试：
     python km_fc.py --dry-run
@@ -41,6 +44,10 @@ LIST_URL = HOST + "/statichtml/purchase/index.html"
 SUPPLY_URL = HOST + "/supplyInfo/supplyInfo_supplyInfoListHtml.action"
 LOGIN_PAGE = HOST + "/html/loginPage.htm"
 LOGIN_API = HOST + "/ajaxJson/unionLogin.action"
+
+# 版本标记：函数测试的返回里一定会带 build 字段。
+# 看不到 build、或者仍是「19 条，电话可见 19 条」这种旧文案，就是控制台还在跑旧代码。
+BUILD = "v3-supply 2026-11-17-18:20"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")
@@ -66,6 +73,11 @@ OUT_SUPPLY = ("/tmp/supplier_km.csv" if os.name != "nt"
 
 def log(msg=""):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _res(ok, msg):
+    """统一返回体：带上 build，方便一眼确认控制台跑的是哪份代码。"""
+    return {"ok": ok, "build": BUILD, "msg": msg}
 
 
 def clean(s):
@@ -350,14 +362,14 @@ def run(dry_run=False):
     user = os.environ.get("KM_USER", "").strip()
     pwd = os.environ.get("KM_PASS", "").strip()
     if not user or not pwd:
-        return {"ok": False, "msg": "缺环境变量 KM_USER / KM_PASS"}
+        return _res(False, "缺环境变量 KM_USER / KM_PASS")
 
     c = Client()
     logged = login(c, user, pwd)
     rows = fetch_rows(c, with_detail=True)
     log(f"  康美需求 {len(rows)} 条（{'已登录' if logged else '未登录'}）")
     if not rows:
-        return {"ok": False, "msg": "抓到 0 条，康美页面结构可能变了"}
+        return _res(False, "抓到 0 条，康美页面结构可能变了")
 
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=HEADER, extrasaction="ignore")
@@ -394,12 +406,12 @@ def run(dry_run=False):
             msg += "；供货抓取失败（需求已正常保存）"
 
     if dry:
-        return {"ok": True, "msg": msg + "（演练，未提交）"}
+        return _res(True, msg + "（演练，未提交）")
     msg += "；" + commit_csv(data, f"康美需求自动更新 {rows[0]['更新日期']}")
     if supply_data:
         msg += "；" + commit_csv(
             supply_data, f"康美供货自动更新 {time.strftime('%Y-%m-%d')}", "supplier_km.csv")
-    return {"ok": True, "msg": msg}
+    return _res(True, msg)
 
 
 def handler(event, context):
@@ -414,7 +426,8 @@ def handler(event, context):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        result = {"ok": False, "msg": f"{type(e).__name__}: {e}"}
+        result = _res(False, f"{type(e).__name__}: {e}")
+    result.setdefault("build", BUILD)
     log(f"结果：{result}")
     if not result.get("ok"):
         # 让 FC 把这次调用标成失败，方便在监控里看到
