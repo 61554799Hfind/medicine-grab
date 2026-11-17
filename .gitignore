@@ -28,6 +28,13 @@ supplier_failed.txt
 
 # 求购抓取产物（三站；CSV 已被上面的 *.csv 覆盖，这里只补 json）
 purchase_data.json
+# 例外：康美在海外 runner 上连不通（443 ConnectTimeout），CI 抓不到，
+# 只能由本机抓好后提交进仓库给 CI 推送用 —— 这一份必须进仓库。
+!purchase_km.csv
+
+# 本机部署说明（里面有康美账号密码）和函数代码包 —— 仓库是公开的，绝不提交
+阿里云部署步骤.txt
+km_fc.zip
 
 # 编辑器与本地工作数据
 .idea/

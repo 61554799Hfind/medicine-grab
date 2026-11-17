@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: '只抓一个站：ytw / km / zx（留空=三个都抓）'
+        description: '只抓一个站：ytw / km / zx（留空=药通网+中香网，康美由阿里云函数负责）'
         required: false
         default: ''
 
@@ -73,17 +73,20 @@ jobs:
           fi
           python -c "import json;d=json.load(open('service_account.json',encoding='utf-8'));assert d.get('type')=='service_account';assert 'private_key' in d;print('密钥校验通过:',d.get('client_email'))"
 
-      - name: 抓取三个站的求购信息
+      - name: 抓取药通网 + 中香网
         env:
           TZ: Asia/Shanghai
           ONLY: ${{ github.event.inputs.only }}
-          KM_USER: ${{ secrets.KM_USER }}   # 可选：康美账号，不配则电话列留空
+          KM_USER: ${{ secrets.KM_USER }}   # 手动 --only km 时才用到
           KM_PASS: ${{ secrets.KM_PASS }}
         run: |
+          # 康美只在「境内出口」能连上（kmb2b.com 对海外 IP 直接 443 丢包），
+          # 所以每天由阿里云函数 07:50 抓好、提交 purchase_km.csv 回仓库，
+          # 这里默认 --skip km：不白等超时，也不出现假的“登录异常”黄线。
           if [ -n "$ONLY" ]; then
             python purchase_crawl.py --only "$ONLY"
           else
-            python purchase_crawl.py
+            python purchase_crawl.py --skip km
           fi
 
       - name: 推送 Google 表格（三个工作表全量覆盖）
@@ -93,8 +96,24 @@ jobs:
         run: python purchase_push.py
 
       - name: 结果自检
+        env:
+          TZ: Asia/Shanghai
         run: |
-          # 先报整体失败的站（purchase_crawl.py 会把摘要写进这个文件）
+          # 出口 IP 不可达（康美在海外 runner 上 443 连接超时）→ 只警告，不判红
+          if [ -f purchase_skipped.txt ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::warning title=站点跳过::$line"
+            done < purchase_skipped.txt
+            {
+              echo "### 有站点被跳过（出口 IP 不可达）"
+              echo ""
+              echo '```'
+              cat purchase_skipped.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # 真正的代码级失败 → 判红
           if [ -f purchase_failed.txt ]; then
             while IFS= read -r line; do
               [ -n "$line" ] && echo "::error title=求购抓取失败::$line"
@@ -102,7 +121,12 @@ jobs:
             echo "::error::有站点整体抓取失败（另外的站点已正常推送）"
             exit 1
           fi
+
           for f in purchase_ytw.csv purchase_km.csv purchase_zx.csv; do
+            if [ ! -f "$f" ]; then
+              echo "$f 不存在，推送时跳过该工作表（表格保留上一份）"
+              continue
+            fi
             n=$(wc -l < "$f")
             echo "$f 行数（含表头）：$n"
             if [ "$n" -lt 2 ]; then
@@ -110,11 +134,45 @@ jobs:
               exit 1
             fi
           done
-          # 康美电话要登录才有；出现「登录后可见」说明 KM_USER/KM_PASS 没配或登录被拒
-          if grep -q "登录后可见" purchase_km.csv; then
-            echo "::warning::康美联系电话仍是「登录后可见」——检查 Secret KM_USER / KM_PASS，或账号是否被锁"
-          else
-            echo "康美电话列正常"
+
+          # 各站数据日期写进运行页摘要，一眼看得出哪张表是哪天抓的
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import csv, os
+          print("\n### 本次表格数据日期\n")
+          print("| 工作表 | 行数 | 更新日期 |")
+          print("|---|---|---|")
+          for tab, fn in (("药通网", "purchase_ytw.csv"),
+                          ("康美中药城", "purchase_km.csv"),
+                          ("中香网", "purchase_zx.csv")):
+              if not os.path.exists(fn):
+                  print(f"| {tab} | 跳过（文件缺失） | - |")
+                  continue
+              with open(fn, encoding="utf-8-sig") as f:
+                  rows = list(csv.DictReader(f))
+              d = rows[0].get("更新日期", "?") if rows else "-"
+              print(f"| {tab} | {len(rows)} | {d} |")
+          PY
+
+          # 康美这份 CSV 由阿里云函数每天 07:50 抓好后提交回仓库（CI 在海外连不上康美），
+          # 所以这里不重抓，只核对它是不是新的、电话是不是还在。
+          if [ -f purchase_km.csv ]; then
+            python - <<'PY'
+          import csv, datetime
+          rows = list(csv.DictReader(open("purchase_km.csv", encoding="utf-8-sig")))
+          d = (rows[0].get("更新日期") or "").strip() if rows else ""
+          phones = sum(1 for r in rows if (r.get("联系电话") or "").strip() not in ("", "登录后可见"))
+          print(f"康美 CSV：{len(rows)} 行，带电话 {phones} 行，更新日期 {d or '空'}")
+          try:
+              age = (datetime.date.today() - datetime.date.fromisoformat(d)).days
+          except Exception:
+              age = 999
+          if age > 2:
+              print(f"::warning title=康美数据没更新::purchase_km.csv 更新日期是 {d or '空'}，"
+                    f"已经 {age} 天没更新——去阿里云函数计算看 km-demand 的调用日志")
+          elif phones == 0:
+              print("::warning title=康美电话缺失::康美 CSV 里没有手机号，"
+                    "多半是阿里云函数登录失败（账号被锁或站点改版）")
+          PY
           fi
 
       - name: 保存结果文件
@@ -128,3 +186,4 @@ jobs:
             purchase_km.csv
             purchase_zx.csv
             purchase_failed.txt
+            purchase_skipped.txt

@@ -54,14 +54,20 @@ import os
 import random
 import re
 import string
+import sys
 import time
 import traceback
 
 import requests
-from cryptography.hazmat.primitives import padding as sympad
-from cryptography.hazmat.primitives.asymmetric import padding as asympad
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.serialization import load_der_public_key
+
+try:  # 只有中香网要加密。阿里云 FC 里只跑康美，不装 cryptography 也能正常工作。
+    from cryptography.hazmat.primitives import padding as sympad
+    from cryptography.hazmat.primitives.asymmetric import padding as asympad
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.serialization import load_der_public_key
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_JSON = os.path.join(BASE_DIR, "purchase_data.json")
@@ -71,6 +77,9 @@ CSV_ZX = os.path.join(BASE_DIR, "purchase_zx.csv")
 # 某个站整体失败时写这个标记文件；CI 的「结果自检」看到它就把 job 判红，
 # 但不会拦住后面的推送步骤 —— 三个站互相独立，一个站挂了不该拖累另外两个。
 FAIL_FILE = os.path.join(BASE_DIR, "purchase_failed.txt")
+# 出口 IP 不可达（ConnectTimeout 之类）单独记这里：这是环境限制，不是代码坏了。
+# CI 只发黄色警告、不判红，并且继续用仓库里上一份 CSV 推表，别把表刷白。
+SKIP_FILE = os.path.join(BASE_DIR, "purchase_skipped.txt")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")
@@ -351,6 +360,8 @@ class ZxPurchase:
         self.pub = None
 
     def handshake(self):
+        if not HAS_CRYPTO:
+            raise RuntimeError("中香网接口要加密，请先 pip install cryptography")
         self.sess.get(self.PAGE, timeout=25)
         j = self.sess.post(self.PUBKEY, json={}, timeout=30,
                            headers={"Content-Type": "application/json",
@@ -486,32 +497,63 @@ def sort_key(row, field, numeric=False):
     return (0, v) if v else (1, "")
 
 
-def probe_hosts():
-    """开跑前先敲一下三个站，把状态码/耗时打出来 —— CI 上出问题一眼能看出是哪个站被墙/被拦。"""
-    for name, url in (("药通网", YtwDemand.ENTRY),
-                      ("康美", KmDemand.LIST),
-                      ("中香网", ZxPurchase.PAGE)):
-        t0 = time.time()
-        try:
-            r = new_session(url).get(url, timeout=20)
-            log(f"  连通 {name}: HTTP {r.status_code}，{len(r.content)} 字节，{time.time() - t0:.1f}s")
-        except Exception as e:
-            log(f"  连通 {name}: ❌ {type(e).__name__}: {str(e)[:100]}")
+def probe_hosts(skip=()):
+    """开跑前先敲一下三个站，把状态码/耗时打出来 —— CI 上出问题一眼能看出是哪个站被墙/被拦。
 
+    返回 {站名: 是否连通}。康美敲两次：它在境外 IP（GitHub Actions）上 443 端口直接
+    连接超时，敲一次就跳过去，省得后面 3 轮重试白等 90 秒。
+    skip 里的站不探测（CI 会 skip 康美，交给阿里云函数抓，别白等）。
+    """
+    ok = {}
+    for key, name, url, tmo in (("ytw", "药通网", YtwDemand.ENTRY, 20),
+                                ("km", "康美", KmDemand.LIST, 10),
+                                ("zx", "中香网", ZxPurchase.PAGE, 20)):
+        if key in skip:
+            log(f"  连通 {name}: 本次跳过，不探测")
+            continue
+        ok[name] = False
+        for i in range(2 if name == "康美" else 1):
+            t0 = time.time()
+            try:
+                r = new_session(url).get(url, timeout=tmo)
+                log(f"  连通 {name}: HTTP {r.status_code}，{len(r.content)} 字节，"
+                    f"{time.time() - t0:.1f}s")
+                ok[name] = True
+                break
+            except Exception as e:
+                log(f"  连通 {name}: ❌ 第 {i + 1} 次 {type(e).__name__}: {str(e)[:100]}")
+    return ok
+
+
+# 网络层错误：出口 IP 到不了对方，跟账号、密码、参数都无关
+NET_ERRORS = (requests.exceptions.ConnectTimeout,
+              requests.exceptions.ReadTimeout,
+              requests.exceptions.ConnectionError,
+              requests.exceptions.SSLError)
 
 FAILED = []
+SKIPPED = []
 
 
-def report_fail(key, name):
-    tb = traceback.format_exc().strip()
+def report_fail(key, name, allow_skip=False):
+    exc = sys.exc_info()[1]
+    first = (str(exc).splitlines()[0] if str(exc) else type(exc).__name__)[:200]
+    if allow_skip and isinstance(exc, NET_ERRORS):
+        log(f"  ⏭️ {name} 出口 IP 不可达，跳过该站（表格继续用仓库里上一份数据，不会刷白）")
+        log(f"     {type(exc).__name__}: {first}")
+        SKIPPED.append(f"{name} | {type(exc).__name__}: {first}")
+        return
     log(f"  ❌ {name} 整体失败，跳过该站（另外两个站照常）")
-    log(tb)
-    FAILED.append(f"{name} | {tb.splitlines()[-1][:200]}")
+    log(traceback.format_exc().strip())
+    FAILED.append(f"{name} | {first}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=["ytw", "km", "zx"], help="只抓一个站")
+    ap.add_argument("--skip", nargs="+", choices=["ytw", "km", "zx"], default=[],
+                    help="跳过某些站（CI 用 --skip km：康美由阿里云函数每天抓，"
+                         "GitHub runner 在海外连不上 kmb2b.com，试了也是白等）")
     ap.add_argument("--no-detail", action="store_true", help="康美不抓详情页（省请求，字段会空）")
     ap.add_argument("--dump", action="store_true", help="打印每条记录的关键字段")
     ap.add_argument("--max-age-days", type=int, default=730,
@@ -520,10 +562,11 @@ def main():
 
     today = time.strftime("%Y-%m-%d")
     data = {}
+    skip = set(args.skip or [])
 
-    probe_hosts()
+    reach = probe_hosts(skip)
 
-    if args.only in (None, "ytw"):
+    if args.only in (None, "ytw") and "ytw" not in skip:
         log("A. 药通网「个人求购」")
         try:
             rows = YtwDemand().fetch()
@@ -542,9 +585,28 @@ def main():
             report_fail("ytw", "药通网")
             data["ytw"] = []   # 不写空 CSV：让推送步骤跳过该 tab，保留昨天那份，别把表刷白
 
-    if args.only in (None, "km"):
+    if "km" in skip:
+        # CI 的正常路径：康美由阿里云函数（国内出口）每天 07:50 抓好、提交回仓库，
+        # 这里什么都不做，直接用仓库里那份 CSV 推表。
+        log("B. 康美中药城「需求信息」→ 跳过（由阿里云函数负责，用仓库里那份 CSV 推表）")
+        if os.path.exists(CSV_KM):
+            try:
+                with open(CSV_KM, encoding="utf-8-sig") as f:
+                    first = next(csv.DictReader(f), None)
+                if first:
+                    log(f"   仓库里这份康美 CSV 更新日期 {first.get('更新日期') or '?'}")
+            except Exception:
+                pass
+        else:
+            log("   ⚠️ 仓库里没有 purchase_km.csv，康美表这轮不会被更新")
+
+    if args.only in (None, "km") and "km" not in skip:
         log("B. 康美中药城「需求信息」")
         try:
+            if reach.get("康美") is False:
+                # 探活两次都不通就不用再试了：走出去也是 ConnectTimeout 白等
+                raise requests.exceptions.ConnectTimeout(
+                    "www.kmb2b.com:443 连接超时（当前出口 IP 到不了康美，与账号密码无关）")
             km = KmDemand()
             user, pwd = os.environ.get("KM_USER", "").strip(), os.environ.get("KM_PASS", "").strip()
             if user and pwd:
@@ -560,10 +622,10 @@ def main():
             data["km"] = rows
             write_csv(CSV_KM, HEADER_KM, rows)
         except Exception:
-            report_fail("km", "康美中药城")
+            report_fail("km", "康美中药城", allow_skip=True)
             data["km"] = []
 
-    if args.only in (None, "zx"):
+    if args.only in (None, "zx") and "zx" not in skip:
         log("C. 中香网「求购」")
         try:
             rows = ZxPurchase().fetch()
@@ -597,6 +659,23 @@ def main():
             + "，".join(x.split(" | ")[0] for x in FAILED))
     elif os.path.exists(FAIL_FILE):
         os.remove(FAIL_FILE)
+
+    # 出口 IP 不可达：只记黄线，CI 不判红，表格里那份数据保持原样
+    if SKIPPED:
+        with open(SKIP_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(SKIPPED) + "\n")
+        log(f"⚠️ {len(SKIPPED)} 个站因出口不可达被跳过："
+            + "，".join(x.split(" | ")[0] for x in SKIPPED))
+        if any(x.startswith("康美") for x in SKIPPED) and os.path.exists(CSV_KM):
+            try:
+                with open(CSV_KM, encoding="utf-8-sig") as f:
+                    first = next(csv.DictReader(f), None)
+                if first:
+                    log(f"  ℹ️ 康美表将继续用仓库里这份 CSV（更新日期 {first.get('更新日期') or '?'}）")
+            except Exception:
+                pass
+    elif os.path.exists(SKIP_FILE):
+        os.remove(SKIP_FILE)
 
     if args.dump:
         for k, v in data.items():
