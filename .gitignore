@@ -3,6 +3,7 @@ service_account.json
 # 目标表格 ID（仓库要公开，ID 不能写进代码；本机只存在这个文件里）
 sheet_id.txt
 sheet_id_supplier.txt
+sheet_id_purchase.txt
 
 # 浏览器配置（体积大且含个人数据）
 browser_profile/
@@ -25,6 +26,9 @@ supplier_data.json
 supplier_data.csv
 supplier_failed.txt
 
+# 求购抓取产物（三站；CSV 已被上面的 *.csv 覆盖，这里只补 json）
+purchase_data.json
+
 # 编辑器与本地工作数据
 .idea/
 .workbuddy/
@@ -35,7 +39,7 @@ __pycache__/
 *.pyc
 
 # 临时探测/调试文件（下划线开头，用完即弃，不进仓库）
-_*.py
-_*.txt
-_*.log
-_*.json
+_*
+zz_*.py
+zzz_*.py
+zzz_*.txt

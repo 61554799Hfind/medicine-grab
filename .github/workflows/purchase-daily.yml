@@ -1,0 +1,115 @@
+name: 每日求购抓取（三站）
+
+on:
+  # 北京时间 08:35（cron 用 UTC，UTC 00:35）。GitHub 定时普遍延迟 5~15 分钟，
+  # 实际落点约 08:40~08:55。和价格线 08:17、供应商线 08:05 错开，
+  # 三个 job 是不同 runner / 不同出口 IP，互不抢药通网限流。
+  schedule:
+    - cron: '35 0 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: '只抓一个站：ytw / km / zx（留空=三个都抓）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: medicine-purchase-crawl
+  cancel-in-progress: false
+
+jobs:
+  purchase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PYTHONUNBUFFERED: '1'
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 检查密钥与表格 ID
+        env:
+          GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
+          SHEET_ID_PURCHASE: ${{ secrets.SHEET_ID_PURCHASE }}
+        run: |
+          if [ -z "$GSHEET_SA_B64" ]; then
+            echo "::error::缺少 Secret GSHEET_SA_B64（Google 服务账号密钥）"
+            exit 1
+          fi
+          if [ -z "$SHEET_ID_PURCHASE" ]; then
+            echo "::error::缺少 Secret SHEET_ID_PURCHASE。去 Settings → Secrets and variables → Actions → New repository secret，名称 SHEET_ID_PURCHASE，值填求购表格 ID（地址栏 /spreadsheets/d/<这串>/edit 中间那串）"
+            exit 1
+          fi
+          echo "密钥与表格 ID 均已配置"
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth cryptography
+
+      - name: 还原 Google 服务账号密钥
+        env:
+          GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
+        run: |
+          RAW="$GSHEET_SA_B64"
+          STRIP=$(printf '%s' "$RAW" | tr -d '[:space:]')
+          if [ "${STRIP:0:1}" = "{" ]; then
+            printf '%s' "$RAW" > service_account.json
+          else
+            if ! printf '%s' "$STRIP" | base64 -d > service_account.json 2>/dev/null; then
+              echo "::error::GSHEET_SA_B64 既不是 JSON 也不是合法 base64（长度 ${#STRIP}，开头 ${STRIP:0:16}）"
+              exit 1
+            fi
+          fi
+          python -c "import json;d=json.load(open('service_account.json',encoding='utf-8'));assert d.get('type')=='service_account';assert 'private_key' in d;print('密钥校验通过:',d.get('client_email'))"
+
+      - name: 抓取三个站的求购信息
+        env:
+          TZ: Asia/Shanghai
+          ONLY: ${{ github.event.inputs.only }}
+          KM_USER: ${{ secrets.KM_USER }}   # 可选：康美账号，不配则电话列留空
+          KM_PASS: ${{ secrets.KM_PASS }}
+        run: |
+          if [ -n "$ONLY" ]; then
+            python purchase_crawl.py --only "$ONLY"
+          else
+            python purchase_crawl.py
+          fi
+
+      - name: 推送 Google 表格（三个工作表全量覆盖）
+        env:
+          TZ: Asia/Shanghai
+          SHEET_ID_PURCHASE: ${{ secrets.SHEET_ID_PURCHASE }}
+        run: python purchase_push.py
+
+      - name: 结果自检
+        run: |
+          for f in purchase_ytw.csv purchase_km.csv purchase_zx.csv; do
+            n=$(wc -l < "$f")
+            echo "$f 行数（含表头）：$n"
+            if [ "$n" -lt 2 ]; then
+              echo "::error::$f 只有表头，抓取大概率被站点拦了"
+              exit 1
+            fi
+          done
+
+      - name: 保存结果文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 求购数据-${{ github.run_number }}
+          retention-days: 14
+          path: |
+            purchase_ytw.csv
+            purchase_km.csv
+            purchase_zx.csv
