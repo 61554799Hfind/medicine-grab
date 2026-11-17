@@ -116,20 +116,23 @@ jobs:
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import csv, os
           print("\n### 供应商各站数据\n")
-          print("| 工作表 | 行数 | 更新日期 |")
-          print("|---|---|---|")
+          print("| 工作表 | 行数 | 列数 | 更新日期 |")
+          print("|---|---|---|---|")
           for tab, fn in (("药通网", "supplier_data.csv"),
                           ("康美", "supplier_km.csv"),
                           ("中香", "supplier_zx.csv")):
               if not os.path.exists(fn):
-                  print(f"| {tab} | 跳过（文件缺失，表里保留上一份） | - |")
+                  print(f"| {tab} | 跳过（文件缺失，表里保留上一份） | - | - |")
                   continue
               with open(fn, encoding="utf-8-sig") as f:
-                  rows = list(csv.DictReader(f))
+                  rd = csv.DictReader(f)
+                  rows = list(rd)
+                  ncols = len(rd.fieldnames or [])
               d = rows[0].get("更新时间", "?") if rows else "-"
-              print(f"| {tab} | {len(rows)} | {d} |")
+              print(f"| {tab} | {len(rows)} | {ncols} | {d} |")
           print()
-          print("康美那份由阿里云函数每早 07:40 抓取提交；日期不是今天说明函数没跑成功。")
+          print("三站表头各自独立：药通网 13 列、康美 8 列、中香 12 列（按各站页面真实字段）。")
+          print("康美那份由阿里云函数每早 07:50 抓取提交；日期不是今天说明函数没跑成功。")
           PY
 
       - name: 保存结果文件

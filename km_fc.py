@@ -56,9 +56,8 @@ HEADER = ["品名", "规格", "产地", "数量", "联系电话", "联系人",
           "剩余天数", "有效期", "仓储所在地", "质量要求", "包装要求",
           "资质要求", "认证信息", "会员类型", "经营所在地", "详情链接", "更新日期"]
 
-# 供货（供应商）用的 13 列，和药通网 supplier_data.csv 完全一致
-SUPPLY_HEADER = ["更新时间", "品名", "规格", "产地", "货源所在地", "单价",
-                 "数量", "联系人", "手机", "供货说明", "发布日期", "剩余天数", "实名认证"]
+# 供货（供应商）用的表头：康美列表页上真实显示的就这几项，和 supplier_extra_crawl.py 的 KM_HEADER 保持一致
+SUPPLY_HEADER = ["更新时间", "品名", "规格", "产地", "货源所在地", "数量", "电话", "详情链接"]
 
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"[\s\u00a0\u3000]+")
@@ -286,14 +285,9 @@ def fetch_supply_rows(c, max_pages=None, gap=0.2):
                 "规格": spec.strip(),
                 "产地": origin.strip(),
                 "货源所在地": clean(one(r'class="place-info">(.*?)</div>')),
-                "单价": "",
                 "数量": clean(one(r'class="price-box">(.*?)</div>')),
-                "联系人": "",
-                "手机": "" if tel == "登录后可见" else tel,
-                "供货说明": "",
-                "发布日期": "",
-                "剩余天数": "",
-                "实名认证": "已认证" if 'class="res-tag' in blk else "",
+                "电话": "" if tel == "登录后可见" else tel,
+                "详情链接": detail_url,
             })
             new += 1
         if new == 0:
@@ -305,8 +299,7 @@ def fetch_supply_rows(c, max_pages=None, gap=0.2):
     today = time.strftime("%Y-%m-%d")
     for r in rows:
         r["更新时间"] = today
-    # 按品名分组，观感和药通网那张表一致
-    rows.sort(key=lambda r: r["品名"])
+    # 康美列表本身就是「上架时间倒序」，保持站点原序，不做二次排序
     log(f"  康美供货 {len(rows)} 条（{page - 1} 页）")
     return rows
 
@@ -398,7 +391,7 @@ def run(dry_run=False):
                 with open(OUT_SUPPLY, "wb") as f:
                     f.write(supply_data)
                 supply_n = len(srows)
-                supply_phones = sum(1 for r in srows if r["手机"])
+                supply_phones = sum(1 for r in srows if r["电话"])
                 msg += f"；供货 {supply_n} 条（电话可见 {supply_phones}）"
         except Exception as e:
             # 供货失败不影响需求提交
