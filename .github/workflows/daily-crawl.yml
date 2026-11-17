@@ -2,19 +2,27 @@ name: 每日药材价格抓取
 
 on:
   # 每天北京时间 08:17 跑一次（cron 用 UTC，= 北京时间 - 8 小时 → UTC 00:17）。
-  # 错开整点：整点是 GitHub 负载最高的时候，容易延迟或被丢弃。
+  # ⚠️ 实测这个仓库的 cron 长期迟到 6~8 小时（见下方「迟到」说明），
+  #    所以真正准时的触发靠 Cloudflare Worker 打 workflow_dispatch；
+  #    这里的 cron 只当兜底 —— 迟到了也没关系，ci_state.py 会发现「今天已抓过」直接跳过。
   schedule:
     - cron: '17 0 * * *'
-  # ⚠️ 注意：仓库连续 60 天没有任何提交，GitHub 会自动停用定时任务（cron 静默不跑）。
-  # 备份方案：Cloudflare Workers（medicine-trigger）定时打 workflow_dispatch，见 cloudflare-worker-trigger.js。
-  # 另：公开仓库的 Actions 分钟数免费不限量；私有仓库 Free 计划只有 2000 分钟/月。
+  # ⚠️ 迟到实测（2026-11-11 ~ 11-17，cron 应在北京 08:17）：
+  #    14:10 / 15:06 / 14:40 / 14:16 / 14:24 / 14:22 / 15:51 才真正启动，延迟 5h53m ~ 7h34m。
+  #    所以用户看到的是「下午三四点才自动跑」。GitHub 对公开仓库的 schedule 只做尽力调度。
+  # ⚠️ 另：仓库连续 60 天没有任何提交，GitHub 会自动停用定时任务（cron 静默不跑）。
   # 也允许在 GitHub 网页上手动点一下就跑，方便随时测试
   workflow_dispatch:
+    inputs:
+      force:
+        description: '今天已经抓过也强制重抓（补抓/调试用）'
+        required: false
+        default: 'false'
 
 # GITHUB_TOKEN 默认权限是受限只读（只有 contents/metadata/packages: read），
-# 访问 actions 相关接口必须显式申请。
+# 访问 actions 相关接口必须显式申请；写 crawl_state.json 需要 contents: write。
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 # ⚠️ 同一时间只允许一个抓取任务。注意这个 group 名不要和 job 上的名称撞车，
@@ -38,6 +46,17 @@ jobs:
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
+
+      # 同一天只抓一次：早上那次成功后，下午迟到的 cron 进来直接跳过。
+      # 状态存在仓库根目录 crawl_state.json（由本文件最后一步写入）。
+      # 想强制重抓：网页 Run workflow 时把 force 填 true，或本地 FORCE=1。
+      - name: 今天是否已经抓过
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TZ: Asia/Shanghai
+          FORCE: ${{ inputs.force }}
+        run: python3 ci_state.py check
 
       # 检查 secrets 里有没有配 GSHEET_SA_B64（还原 Google 服务账号密钥要用）。
       # 配了 → 正常推送 Google Sheet；没配 → 自动跳过 Google 相关步骤，只抓数据，任务仍为绿色。
@@ -76,6 +95,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安装依赖
+        if: steps.guard.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -85,7 +105,7 @@ jobs:
       # 复制带进来的 \r（用 Out-File 存的文件是 CRLF，粘进来会让 base64 -d 报 invalid input）。
       # 解出来后立刻用 python 校验内容，避免"文件写出来了但不对"要到很后面才炸。
       - name: 还原 Google 服务账号密钥
-        if: steps.sa.outputs.ok == 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.sa.outputs.ok == 'true'
         env:
           GSHEET_SA_B64: ${{ secrets.GSHEET_SA_B64 }}
         run: |
@@ -113,6 +133,7 @@ jobs:
 
       # 抓取药材涨落数据，并推送到 Google Sheet 的 medicine_data（没配密钥时只抓不推）
       - name: 抓取数据并推送
+        if: steps.guard.outputs.skip != 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
           # 想隐藏表格 ID（比如仓库要公开）时，在仓库 Settings → Secrets 里加一个 SHEET_ID，
@@ -128,6 +149,7 @@ jobs:
 
       # 抓历史日价格（接口一次返回全部，很快）
       - name: 抓取历史价格日数据
+        if: steps.guard.outputs.skip != 'true'
         env:
           TZ: Asia/Shanghai
         run: python history_crawl.py --incremental
@@ -144,7 +166,7 @@ jobs:
       #   「一个 batch 请求只算 1 次配额」，故 CHART_BATCH 调大到 100（1591 图只要 16 次请求）。
       #   官方明确：不超每分钟配额就没有每日总量上限 —— 不会被封，超了只是返回 429 等一分钟。
       - name: 建药材历史价格大图（分卷，覆盖更新）
-        if: steps.sa.outputs.ok == 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.sa.outputs.ok == 'true'
         env:
           SERVICE_ACCOUNT_FILE: ${{ github.workspace }}/service_account.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -154,6 +176,7 @@ jobs:
         run: python build_herb_sheets.py --per-sheet 50 --drop-monthly --jobs 6
 
       - name: 结果自检
+        if: steps.guard.outputs.skip != 'true'
         run: |
           lines=$(wc -l < 药材涨落对比结果.csv)
           echo "CSV 行数（含表头）：$lines"
@@ -165,7 +188,7 @@ jobs:
       # 抓取脚本在推送失败时只打一行日志、不会让任务失败。
       # 没有这一步，推送失败时任务照样显示绿色，表格不更新你也不会收到通知。
       - name: 校验 Google Sheet 推送结果
-        if: steps.sa.outputs.ok == 'true'
+        if: steps.guard.outputs.skip != 'true' && steps.sa.outputs.ok == 'true'
         run: |
           if grep -q "推送成功" crawl.log; then
             echo "Google Sheet 推送成功"
@@ -178,8 +201,25 @@ jobs:
             exit 1
           fi
 
+      # 放在推送校验之后：只有「抓到数据 + 推送成功」才算今天完成。
+      # 这样如果早上那次推送失败了，下午迟到的 cron 还会再试一次，不会误判成已完成。
+      - name: 记录今天已完成（同一天不再重抓）
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TZ: Asia/Shanghai
+        run: |
+          python - <<'PY'
+          import csv, subprocess
+          rows = list(csv.DictReader(open("药材涨落对比结果.csv", encoding="utf-8-sig")))
+          meds = len({next(iter(r.values())) for r in rows})
+          print(f"本次结果：{len(rows)} 行 / {meds} 味")
+          subprocess.run(["python", "ci_state.py", "save",
+                          "--rows", str(len(rows)), "--meds", str(meds)], check=True)
+          PY
+
       - name: 保存结果文件
-        if: always()
+        if: always() && steps.guard.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: 药材数据-${{ github.run_number }}
