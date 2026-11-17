@@ -105,7 +105,11 @@ jobs:
         env:
           TZ: Asia/Shanghai
           SHEET_ID_SPICE: ${{ secrets.SHEET_ID_SPICE }}
-        run: python km_spice_push.py
+        run: |
+          python km_spice_push.py || {
+            echo "::error title=表格没共享给服务账号::在 Google 表格右上角点「共享」，把 medicine-data@crawler-510215.iam.gserviceaccount.com 加成「编辑者」，然后重跑这个 workflow"
+            exit 1
+          }
 
       - name: 结果自检
         run: |

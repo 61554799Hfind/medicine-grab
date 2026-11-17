@@ -321,11 +321,25 @@ def main():
     sid = require_sheet_id()
     try:
         sh = gc.open_by_key(sid)
-    except gspread.SpreadsheetNotFound:
+    except (gspread.SpreadsheetNotFound, PermissionError) as e:
+        # 403 是「没共享给服务账号」，404 是 ID 不对或没共享，两者对人来说要做的是同一件事
         raise SystemExit(
-            "服务账号 %s 打不开表格 %s\n"
-            "→ 请在 Google 表格里点「共享」，把这个邮箱加成「编辑者」。" % (sa_email, sid))
+            "服务账号 %s 打不开这个表格（%s）\n"
+            "→ 在 Google 表格点右上角「共享」，把这个邮箱加成「编辑者」，再重跑一次。"
+            % (sa_email, type(e).__name__))
     log("打开表格「%s」" % sh.title)
+
+    # 删掉新建表格自带的空白 Sheet1（只删确实是空的那种，有数据绝不动）
+    for name in ("Sheet1", "工作表1", "Sheet"):
+        ws0 = sheet_or_none(sh, name)
+        if ws0 is None:
+            continue
+        try:
+            if not ws0.get_all_values():
+                api(sh.del_worksheet, ws0)
+                log("删掉空白默认工作表「%s」" % name)
+        except Exception as e:
+            log("跳过删除「%s」：%s" % (name, e))
 
     write_table(sh, TAB_PRICE, header, rows)
     write_table(sh, TAB_RANK, RANK_HEADER, rank_rows)
