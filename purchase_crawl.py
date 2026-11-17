@@ -55,6 +55,7 @@ import random
 import re
 import string
 import time
+import traceback
 
 import requests
 from cryptography.hazmat.primitives import padding as sympad
@@ -67,6 +68,9 @@ OUT_JSON = os.path.join(BASE_DIR, "purchase_data.json")
 CSV_YTW = os.path.join(BASE_DIR, "purchase_ytw.csv")
 CSV_KM = os.path.join(BASE_DIR, "purchase_km.csv")
 CSV_ZX = os.path.join(BASE_DIR, "purchase_zx.csv")
+# 某个站整体失败时写这个标记文件；CI 的「结果自检」看到它就把 job 判红，
+# 但不会拦住后面的推送步骤 —— 三个站互相独立，一个站挂了不该拖累另外两个。
+FAIL_FILE = os.path.join(BASE_DIR, "purchase_failed.txt")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0")
@@ -122,6 +126,22 @@ def decode_html(resp):
 
 def md5_hex(s):
     return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def get_retry(sess, url, attempts=3, timeout=30, **kw):
+    """带重试的 GET：海外 runner 访问国内小站偶尔会 5xx / 握手超时，重试两轮基本就过。"""
+    last = None
+    for i in range(attempts):
+        try:
+            r = sess.get(url, timeout=timeout, **kw)
+            if r.status_code < 500:
+                return r
+            last = RuntimeError(f"HTTP {r.status_code}")
+        except Exception as e:
+            last = e
+        if i < attempts - 1:
+            time.sleep(2 + i * 3)
+    raise last
 
 
 # ================================================================ A. 药通网
@@ -244,7 +264,7 @@ class KmDemand:
             log(f"  康美登录异常：{type(e).__name__}: {e}")
 
     def fetch(self, with_detail=True):
-        r = self.sess.get(self.LIST, timeout=30)
+        r = get_retry(self.sess, self.LIST)
         html = decode_html(r)
         if "登录后可见" not in html and "goods-item" not in html:
             log(f"  ⚠️ 康美列表异常（{r.status_code}，{len(html)} 字节）")
@@ -357,7 +377,15 @@ class ZxPurchase:
         return json.loads((u.update(raw) + u.finalize()).decode("utf-8"))
 
     def fetch(self):
-        self.handshake()
+        for attempt in range(3):
+            try:
+                self.handshake()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                log(f"  中香网握手第 {attempt + 1} 次失败（{type(e).__name__}），重试")
+                time.sleep(3 + attempt * 3)
         rows, seen = [], set()
         for pg in range(1, self.MAX_PAGES + 1):
             time.sleep(0.2)
@@ -458,6 +486,29 @@ def sort_key(row, field, numeric=False):
     return (0, v) if v else (1, "")
 
 
+def probe_hosts():
+    """开跑前先敲一下三个站，把状态码/耗时打出来 —— CI 上出问题一眼能看出是哪个站被墙/被拦。"""
+    for name, url in (("药通网", YtwDemand.ENTRY),
+                      ("康美", KmDemand.LIST),
+                      ("中香网", ZxPurchase.PAGE)):
+        t0 = time.time()
+        try:
+            r = new_session(url).get(url, timeout=20)
+            log(f"  连通 {name}: HTTP {r.status_code}，{len(r.content)} 字节，{time.time() - t0:.1f}s")
+        except Exception as e:
+            log(f"  连通 {name}: ❌ {type(e).__name__}: {str(e)[:100]}")
+
+
+FAILED = []
+
+
+def report_fail(key, name):
+    tb = traceback.format_exc().strip()
+    log(f"  ❌ {name} 整体失败，跳过该站（另外两个站照常）")
+    log(tb)
+    FAILED.append(f"{name} | {tb.splitlines()[-1][:200]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=["ytw", "km", "zx"], help="只抓一个站")
@@ -470,46 +521,60 @@ def main():
     today = time.strftime("%Y-%m-%d")
     data = {}
 
+    probe_hosts()
+
     if args.only in (None, "ytw"):
         log("A. 药通网「个人求购」")
-        rows = YtwDemand().fetch()
-        if args.max_age_days:
-            kept = [r for r in rows if is_fresh(r["发布日期"], args.max_age_days)]
-            if len(kept) != len(rows):
-                log(f"  过滤掉 {len(rows) - len(kept)} 条 {args.max_age_days} 天前的老帖"
-                    f"（平台仍在刷新剩余天数，但日期太老）")
-            rows = kept
-        rows.sort(key=lambda r: (sort_key(r, "发布日期"), sort_key(r, "品名")))
-        for r in rows:
-            r["更新日期"] = today
-        data["ytw"] = rows
-        write_csv(CSV_YTW, HEADER_YTW, rows)
+        try:
+            rows = YtwDemand().fetch()
+            if args.max_age_days:
+                kept = [r for r in rows if is_fresh(r["发布日期"], args.max_age_days)]
+                if len(kept) != len(rows):
+                    log(f"  过滤掉 {len(rows) - len(kept)} 条 {args.max_age_days} 天前的老帖"
+                        f"（平台仍在刷新剩余天数，但日期太老）")
+                rows = kept
+            rows.sort(key=lambda r: (sort_key(r, "发布日期"), sort_key(r, "品名")))
+            for r in rows:
+                r["更新日期"] = today
+            data["ytw"] = rows
+            write_csv(CSV_YTW, HEADER_YTW, rows)
+        except Exception:
+            report_fail("ytw", "药通网")
+            data["ytw"] = []   # 不写空 CSV：让推送步骤跳过该 tab，保留昨天那份，别把表刷白
 
     if args.only in (None, "km"):
         log("B. 康美中药城「需求信息」")
-        km = KmDemand()
-        user, pwd = os.environ.get("KM_USER", "").strip(), os.environ.get("KM_PASS", "").strip()
-        if user and pwd:
-            km.login(user, pwd)
-        else:
-            log("  未设 KM_USER / KM_PASS，跳过登录（电话列会留空）")
-        rows = km.fetch(with_detail=not args.no_detail)
-        # 康美没有发布时间 → 剩余天数越大 = 发布越早
-        rows.sort(key=lambda r: (-(int(r["剩余天数"]) if r["剩余天数"].isdigit() else -1),
-                                 r["品名"]))
-        for r in rows:
-            r["更新日期"] = today
-        data["km"] = rows
-        write_csv(CSV_KM, HEADER_KM, rows)
+        try:
+            km = KmDemand()
+            user, pwd = os.environ.get("KM_USER", "").strip(), os.environ.get("KM_PASS", "").strip()
+            if user and pwd:
+                km.login(user, pwd)
+            else:
+                log("  未设 KM_USER / KM_PASS，跳过登录（电话列会留空）")
+            rows = km.fetch(with_detail=not args.no_detail)
+            # 康美没有发布时间 → 剩余天数越大 = 发布越早
+            rows.sort(key=lambda r: (-(int(r["剩余天数"]) if r["剩余天数"].isdigit() else -1),
+                                     r["品名"]))
+            for r in rows:
+                r["更新日期"] = today
+            data["km"] = rows
+            write_csv(CSV_KM, HEADER_KM, rows)
+        except Exception:
+            report_fail("km", "康美中药城")
+            data["km"] = []
 
     if args.only in (None, "zx"):
         log("C. 中香网「求购」")
-        rows = ZxPurchase().fetch()
-        rows.sort(key=lambda r: (sort_key(r, "发布日期"), sort_key(r, "品名")))
-        for r in rows:
-            r["更新日期"] = today
-        data["zx"] = rows
-        write_csv(CSV_ZX, HEADER_ZX, rows)
+        try:
+            rows = ZxPurchase().fetch()
+            rows.sort(key=lambda r: (sort_key(r, "发布日期"), sort_key(r, "品名")))
+            for r in rows:
+                r["更新日期"] = today
+            data["zx"] = rows
+            write_csv(CSV_ZX, HEADER_ZX, rows)
+        except Exception:
+            report_fail("zx", "中香网")
+            data["zx"] = []
 
     # 合并存档：只保留本次抓到的站，方便断点/排查
     if os.path.exists(OUT_JSON) and args.only:
@@ -523,6 +588,15 @@ def main():
         json.dump(data, f, ensure_ascii=False, indent=1)
     log(f"汇总 → {os.path.basename(OUT_JSON)}（"
         + "，".join(f"{k} {len(v)}" for k, v in data.items()) + "）")
+
+    # 失败标记：CI 的「结果自检」据此把 job 判红（放在推送之后判断，别拦数据）
+    if FAILED:
+        with open(FAIL_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(FAILED) + "\n")
+        log(f"⚠️ {len(FAILED)} 个站失败，已写 {os.path.basename(FAIL_FILE)}："
+            + "，".join(x.split(" | ")[0] for x in FAILED))
+    elif os.path.exists(FAIL_FILE):
+        os.remove(FAIL_FILE)
 
     if args.dump:
         for k, v in data.items():

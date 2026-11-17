@@ -94,6 +94,14 @@ jobs:
 
       - name: 结果自检
         run: |
+          # 先报整体失败的站（purchase_crawl.py 会把摘要写进这个文件）
+          if [ -f purchase_failed.txt ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=求购抓取失败::$line"
+            done < purchase_failed.txt
+            echo "::error::有站点整体抓取失败（另外的站点已正常推送）"
+            exit 1
+          fi
           for f in purchase_ytw.csv purchase_km.csv purchase_zx.csv; do
             n=$(wc -l < "$f")
             echo "$f 行数（含表头）：$n"
@@ -106,7 +114,7 @@ jobs:
           if grep -q "登录后可见" purchase_km.csv; then
             echo "::warning::康美联系电话仍是「登录后可见」——检查 Secret KM_USER / KM_PASS，或账号是否被锁"
           else
-            echo "康美电话列正常，带号码 $(grep -c '^[^,]' purchase_km.csv) 行左右"
+            echo "康美电话列正常"
           fi
 
       - name: 保存结果文件
@@ -119,3 +127,4 @@ jobs:
             purchase_ytw.csv
             purchase_km.csv
             purchase_zx.csv
+            purchase_failed.txt
