@@ -1,0 +1,338 @@
+# -*- coding: utf-8 -*-
+r"""
+把康美香料价格推到 Google 表格（每天全量覆盖）
+
+表格：sheet_id_spice.txt 里那一份（也可以给环境变量 SHEET_ID_SPICE）
+    · 香料价格   —— 明细：品名/规格/产地 + 亳州 安国 成都 玉林 廉桥 普宁 六市场价
+                    + 最高/最低/均价 + 周月季年涨跌 + 走势 + 更新日期
+    · 香料涨跌榜 —— 同一批数据按「周涨跌」从大到小排，一眼看出谁在涨谁在跌
+    · 香料走势   —— 每味一张折线图（近一年逐日价）+ 月度均价小表，对应药通网那种走势图
+
+数据来源：km_spice.py（跑在阿里云函数上抓 kmzyw.com.cn，抓完提交 CSV/JSON 回仓库）
+    km_spice_price.csv   明细
+    km_spice_hist.json   走势
+
+设计要点（沿用三条线已验证的规矩）
+------------------------------------------------------------------
+1. 全量覆盖：先 unmergeCells 再 clear 再写（clear 不解除合并，不 unmerge 会让 A 列只剩左上角）。
+2. 普通表格：只做「冻结表头 + 表头加粗 + 筛选器 + 列宽」，**不加任何底色**。
+   「涨/跌」靠文字（▲▼）表达，不靠颜色 —— 导出到 Excel 也不会丢信息。
+3. RAW 写入：价格保持页面上给的两位小数，日期是 ISO 文本。
+4. 图表数据放在隐藏表「走势数据」里，图表用 hiddenDimensionStrategy=SHOW_ALL 才能读到隐藏表。
+5. 429 限速：整轮约 20 次请求，撞了就等 70 秒重试。
+
+用法
+------------------------------------------------------------------
+    .venv\Scripts\python.exe km_spice_push.py            # 推表
+    .venv\Scripts\python.exe km_spice_push.py --dry-run  # 只统计不写表
+"""
+import argparse
+import csv
+import gzip
+import json
+import os
+import time
+
+import gspread
+from gspread.exceptions import APIError
+
+from km_spice import MARKETS, PRICE_HEADER
+from supplier_push import BATCH, connect, ensure_sheet, log
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PRICE = os.path.join(BASE_DIR, "km_spice_price.csv")
+JSON_HIST = os.path.join(BASE_DIR, "km_spice_hist.json")
+SHEET_ID_FILE = os.path.join(BASE_DIR, "sheet_id_spice.txt")
+
+TAB_PRICE = "香料价格"
+TAB_RANK = "香料涨跌榜"
+TAB_TREND = "香料走势"
+TAB_POOL = "走势数据"
+
+RANK_HEADER = ["品名", "规格", "产地", "现价", "周涨跌", "月涨跌", "季涨跌", "年涨跌", "走势"]
+CHANGE_COLS = ["周涨跌", "月涨跌", "季涨跌", "年涨跌"]
+
+# 走势页：每味一块。A:B 放月度均价小表，图贴在 C 列，块高 16 行
+BLOCK_H = 16
+CHART_W, CHART_H = 900, 280
+
+WIDTHS = {"品名": 110, "规格": 120, "产地": 90, "更新日期": 100,
+          "六市场均价": 110, "最高价": 90, "最低价": 90, "现价": 90}
+
+
+def api(fn, *a, **kw):
+    """429 限速保护：撞了就等 70 秒再试，最多 3 轮。"""
+    for i in range(3):
+        try:
+            return fn(*a, **kw)
+        except APIError as e:
+            if "429" not in str(e) or i == 2:
+                raise
+            log("  ⚠️ 撞到 429 限速，等 70 秒后重试（第 %d 次）" % (i + 1))
+            time.sleep(70)
+
+
+def require_sheet_id():
+    sid = os.environ.get("SHEET_ID_SPICE", "").strip()
+    if not sid and os.path.exists(SHEET_ID_FILE):
+        sid = open(SHEET_ID_FILE, encoding="utf-8").read().strip()
+    if not sid:
+        raise SystemExit(
+            "找不到香料价格表 ID。\n"
+            "  请把表格 ID 写进 %s（一行），或设环境变量 SHEET_ID_SPICE。" % SHEET_ID_FILE)
+    return sid
+
+
+def arrow(p):
+    """涨跌 → 带箭头文字：+3.2% → ▲ 3.20%，-1.8% → ▼ 1.80%，0 → 持平"""
+    if p is None or p == "":
+        return ""
+    try:
+        v = float(p)
+    except (TypeError, ValueError):
+        return str(p)
+    if v > 0:
+        return "▲ %.2f%%" % v
+    if v < 0:
+        return "▼ %.2f%%" % abs(v)
+    return "持平"
+
+
+def load():
+    if not os.path.exists(CSV_PRICE):
+        raise SystemExit("没找到 %s，先跑 km_spice.py" % CSV_PRICE)
+    with open(CSV_PRICE, encoding="utf-8-sig", newline="") as f:
+        rd = csv.reader(f)
+        header = next(rd, None) or []
+        rows = [r for r in rd if r and any(c.strip() for c in r)]
+    # 走势：仓库里存的是 gz（阿里云函数提交，约 39KB），本机跑时是 .json
+    hist = {}
+    if os.path.exists(JSON_HIST + ".gz"):
+        with gzip.open(JSON_HIST + ".gz", "rt", encoding="utf-8") as f:
+            hist = json.load(f)
+    elif os.path.exists(JSON_HIST):
+        hist = json.load(open(JSON_HIST, encoding="utf-8"))
+    return header, rows, hist
+
+
+def monthly(series):
+    """逐日 → 月度均价 [(YYYY-MM, 均价), ...]"""
+    acc = {}
+    for d, p in series:
+        m = d[:7]
+        a = acc.setdefault(m, [0.0, 0])
+        a[0] += p
+        a[1] += 1
+    return [(m, round(acc[m][0] / acc[m][1], 2)) for m in sorted(acc)]
+
+
+def stat_line(series):
+    """标题后面那句：区间 / 最新 / 一年高 / 一年低 / 涨跌幅"""
+    if not series:
+        return ""
+    prices = [p for _, p in series]
+    hi, lo = max(prices), min(prices)
+    last, first = series[-1][1], series[0][1]
+    chg = (last - first) / first * 100 if first else 0
+    return ("%s ~ %s ｜ 最新 %.2f ｜ 一年最高 %.2f ｜ 一年最低 %.2f ｜ 区间 %+.1f%%"
+            % (series[0][0], series[-1][0], last, hi, lo, chg))
+
+
+def sheet_or_none(sh, title):
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return None
+
+
+def write_table(sh, title, header, rows, widths=True):
+    """一张普通表：unmerge → clear → RAW 覆盖写 → 冻结表头/加粗/筛选器/列宽（无底色）"""
+    ws = ensure_sheet(sh, title, len(rows) + 50, len(header))
+    api(sh.batch_update, {"requests": [{"unmergeCells": {"range": {"sheetId": ws.id}}}]})
+    ws.clear()
+    api(ws.update, [header], "A1", value_input_option="RAW")
+    n = 0
+    for i in range(0, len(rows), BATCH):
+        chunk = rows[i:i + BATCH]
+        api(ws.update, chunk, "A%d" % (i + 2), value_input_option="RAW")
+        n += len(chunk)
+    reqs = [
+        {"updateCells": {"range": {"sheetId": ws.id}, "fields": "userEnteredFormat"}},
+        {"repeatCell": {
+            "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat"}},
+        {"updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}},
+            "fields": "gridProperties.frozenRowCount"}},
+        {"setBasicFilter": {"filter": {"range": {
+            "sheetId": ws.id, "startRowIndex": 0, "endRowIndex": len(rows) + 1,
+            "startColumnIndex": 0, "endColumnIndex": len(header)}}}},
+    ]
+    if widths:
+        for col, px in WIDTHS.items():
+            if col in header:
+                i = header.index(col)
+                reqs.append({"updateDimensionProperties": {
+                    "range": {"sheetId": ws.id, "dimension": "COLUMNS",
+                              "startIndex": i, "endIndex": i + 1},
+                    "properties": {"pixelSize": px}, "fields": "pixelSize"}})
+    api(sh.batch_update, {"requests": reqs})
+    log("「%s」写入 %d 行 × %d 列" % (title, n, len(header)))
+    return ws
+
+
+def write_pool(sh, items):
+    """隐藏表「走势数据」：每味一段 [日期, 价格]，返回每段的 0-based 行范围"""
+    total = sum(1 + len(s) for _, s in items) + 20
+    ws = ensure_sheet(sh, TAB_POOL, total, 2)
+    ws.clear()
+    buf, spans = [], []
+    for key, series in items:
+        start = len(buf)
+        buf.append(["日期", "价格"])
+        for d, p in series:
+            buf.append([d, p])
+        spans.append((key, start, len(buf)))       # endRowIndex 是开区间
+    for i in range(0, len(buf), BATCH):
+        api(ws.update, buf[i:i + BATCH], "A%d" % (i + 1), value_input_option="RAW")
+    api(sh.batch_update, {"requests": [{"updateSheetProperties": {
+        "properties": {"sheetId": ws.id, "hidden": True}, "fields": "hidden"}}]})
+    log("「%s」写入 %d 行数据源（已隐藏）" % (TAB_POOL, len(buf)))
+    return ws, spans
+
+
+def chart_req(sid, title, pool_id, r0, r1, anchor_row):
+    return {"addChart": {"chart": {
+        "spec": {
+            "title": title,
+            # 数据源表是隐藏的，必须显式声明读隐藏行列，否则图出来是空的
+            "hiddenDimensionStrategy": "SHOW_ALL",
+            "basicChart": {
+                "chartType": "LINE",
+                "legendPosition": "NO_LEGEND",
+                "axis": [{"position": "BOTTOM_AXIS", "title": "日期"},
+                         {"position": "LEFT_AXIS", "title": "元/千克"}],
+                "domains": [{"domain": {"sourceRange": {"sources": [{
+                    "sheetId": pool_id, "startRowIndex": r0, "endRowIndex": r1,
+                    "startColumnIndex": 0, "endColumnIndex": 1}]}}}],
+                "series": [{"series": {"sourceRange": {"sources": [{
+                    "sheetId": pool_id, "startRowIndex": r0, "endRowIndex": r1,
+                    "startColumnIndex": 1, "endColumnIndex": 2}]}},
+                    "targetAxis": "LEFT_AXIS"}],
+                "headerCount": 1,
+            },
+        },
+        "position": {"overlayPosition": {
+            "anchorCell": {"sheetId": sid, "rowIndex": anchor_row, "columnIndex": 2},
+            "widthPixels": CHART_W, "heightPixels": CHART_H}},
+    }}}
+
+
+def write_trend(sh, items):
+    """走势页：每味一个区块（标题 + 月度均价小表）+ 一张折线图"""
+    ws = ensure_sheet(sh, TAB_TREND, len(items) * BLOCK_H + 30, 12)
+    api(sh.batch_update, {"requests": [{"updateCells": {
+        "range": {"sheetId": ws.id}, "fields": "userEnteredFormat"}}]})
+    ws.clear()
+
+    pool, spans = write_pool(sh, items)
+    span_map = {k: (r0, r1) for k, r0, r1 in spans}
+
+    area, reqs = [], []
+    for idx, (key, series) in enumerate(items):
+        name = key.replace("|", " ")
+        bs = idx * BLOCK_H
+        while len(area) < bs + BLOCK_H:
+            area.append([""] * 12)
+        area[bs][0] = "%s — 近一年价格走势" % name
+        area[bs][2] = stat_line(series)
+        area[bs + 1][0], area[bs + 1][1] = "月份", "均价"
+        for j, (m, v) in enumerate(monthly(series), start=2):
+            if bs + j < len(area):
+                area[bs + j][0], area[bs + j][1] = m, v
+        r0, r1 = span_map[key]
+        reqs.append(chart_req(ws.id, name, pool.id, r0, r1, bs + 1))
+
+    api(ws.update, area, "A1", value_input_option="RAW")
+
+    # 旧图清理：先查出本表已有的图表并删掉（每天全量重建）
+    meta = api(sh.fetch_sheet_metadata,
+               {"fields": "sheets(properties(sheetId),charts(chartId,position(overlayPosition(anchorCell))))"})
+    old = []
+    for s in meta.get("sheets", []):
+        if s.get("properties", {}).get("sheetId") != ws.id:
+            continue
+        for ch in s.get("charts", []) or []:
+            old.append(ch["chartId"])
+    if old:
+        api(sh.batch_update, {"requests": [{"deleteEmbeddedObject": {"objectId": cid}}
+                                           for cid in old]})
+        log("  清掉旧图 %d 张" % len(old))
+    for i in range(0, len(reqs), 100):
+        api(sh.batch_update, {"requests": reqs[i:i + 100]})
+    log("「%s」%d 味走势图 + 月度均价表" % (TAB_TREND, len(reqs)))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    header, rows, hist = load()
+    idx = {c: i for i, c in enumerate(header)}
+
+    def cell(r, c):
+        i = idx.get(c)
+        return r[i] if i is not None and i < len(r) else ""
+
+    # 涨跌榜：按周涨跌从大到小，没有涨跌数据的排最后
+    def wk(r):
+        try:
+            return float(cell(r, "周涨跌") or "")
+        except ValueError:
+            return -999
+    rank = sorted(rows, key=lambda r: (-wk(r), cell(r, "品名")))
+    rank_rows = []
+    for r in rank:
+        line = [cell(r, c) for c in ("品名", "规格", "产地", "现价")]
+        line += [arrow(cell(r, c)) for c in CHANGE_COLS]
+        line.append(cell(r, "走势"))
+        rank_rows.append(line)
+
+    items = [(k, v["series"]) for k, v in hist.items() if v.get("series")]
+    items.sort(key=lambda x: x[0])
+
+    log("明细 %d 行 × %d 列；涨跌榜 %d 行；走势 %d 味"
+        % (len(rows), len(header), len(rank_rows), len(items)))
+    if rows:
+        log("样例：%s / %s / %s  周 %s"
+            % (cell(rows[0], "品名"), cell(rows[0], "规格"),
+               cell(rows[0], "产地"), arrow(cell(rows[0], "周涨跌"))))
+    up = sum(1 for r in rank_rows if r[4].startswith("▲"))
+    down = sum(1 for r in rank_rows if r[4].startswith("▼"))
+    log("周涨跌：涨 %d 味 / 跌 %d 味 / 其余持平或无数据" % (up, down))
+
+    if a.dry_run:
+        log("--dry-run，不写表")
+        return
+
+    gc, sa_email = connect()
+    sid = require_sheet_id()
+    try:
+        sh = gc.open_by_key(sid)
+    except gspread.SpreadsheetNotFound:
+        raise SystemExit(
+            "服务账号 %s 打不开表格 %s\n"
+            "→ 请在 Google 表格里点「共享」，把这个邮箱加成「编辑者」。" % (sa_email, sid))
+    log("打开表格「%s」" % sh.title)
+
+    write_table(sh, TAB_PRICE, header, rows)
+    write_table(sh, TAB_RANK, RANK_HEADER, rank_rows)
+    write_trend(sh, items)
+
+    log("全部完成 → https://docs.google.com/spreadsheets/d/%s/edit" % sid)
+
+
+if __name__ == "__main__":
+    main()

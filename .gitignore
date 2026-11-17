@@ -4,6 +4,7 @@ service_account.json
 sheet_id.txt
 sheet_id_supplier.txt
 sheet_id_purchase.txt
+sheet_id_spice.txt
 
 # 浏览器配置（体积大且含个人数据）
 browser_profile/
@@ -34,11 +35,23 @@ purchase_data.json
 # 同理：康美「供货」（供应商）也由阿里云函数抓好后提交回仓库
 !supplier_km.csv
 
+# 康美香料价格（kmzyw.com.cn，海外 runner 同样连不通）—— 由「香料」那个阿里云函数
+# 每天抓好提交回仓库，CI 只负责推表，所以这两份必须进仓库
+!km_spice_price.csv
+!km_spice_hist.json.gz
+# 本机跑出来的未压缩走势（336KB，只有函数提交的 .gz 才进仓库）
+km_spice_hist.json
+_km_spice_*.csv
+_km_spice_*.json.gz
+
 # 本机部署说明（里面有康美账号密码）和函数代码包 —— 仓库是公开的，绝不提交
 阿里云部署步骤.txt
+阿里云-香料函数部署步骤.txt
 km_fc.zip
+km_spice.zip
 # km_fc.zip 解压出来的上传目录（和 km_fc.py 内容一样，只是喂给控制台，不进仓库）
 km_fc/
+km_spice_fc/
 
 # 编辑器与本地工作数据
 .idea/
