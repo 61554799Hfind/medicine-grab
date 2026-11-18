@@ -18,6 +18,13 @@ r"""
         dailyPriceChangeAmount 日涨跌额 / dailyPriceChangePercentage 较前日 /
         monthPriceChangePercentage 较月初 / yearPriceChangePercentage 较年初 /
         skuUnit 单位（元/公斤、元/克、元/个、元/斤…）
+· 另一个接口 skuController/getSkuPricePageList（明文 POST，按 skuTypeId）
+  分类树 groupByDesc 有 81 个 skuType，但真正有报价的仍是同样 135 行/50 品类 —— 数据源硬上限。
+· **收录口径对标 medicine_list.txt（971 味），口径同康美线**：品类逐字命中清单就收，
+  再加 NAME_ALIAS 里的同物异名/规格变体映射（八角→八角茴香、干枝八角→八角茴香、
+  桂通→肉桂、圆壳砂仁→砂仁、红花椒→花椒、沙姜→山奈、积壳→枳壳…）。
+  CSV 多一列「清单名」标出对应关系：清单内 131 行/41 味；清单外 4 品类
+  （圆香果、长香果、绿豆蔻、葫芦巴）照留但清单名留空，宁可标「清单外」也不硬并。
 · **没有历史价格接口**：getSkuSpecPriceTrend / getSkuSpecPriceTrendGroup 只回涨跌幅分布
   统计（riseCount/stableCount/fallCount），全站 40 个前端 chunk 里没有任何页面调用它们；
   getSkuPriceHistory 之类的猜想路径全部 404；Excel 接口也不吃日期参数。
@@ -26,7 +33,7 @@ r"""
 
 产物
 ------------------------------------------------------------------
-    zx_price.csv          明细（135 行 × 12 列）
+    zx_price.csv          明细（135 行 × 13 列，含「清单名」）
     zx_price_hist.json.gz 每行一个逐日价格序列 {"国内|八角|广西|大红碎片": {"2026-11-18": 22.25}}
 
 用法
@@ -64,8 +71,51 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 # 列名直接照官网表头：「品类/产地 | 规格 | 今日 | 前日 | 日涨跌 | 较前日 | 较月初 | 较年初 | 单位」
 # 多出来的「市场」是官网的「国内/国外」tab；末列「更新时间」是四条线统一的收尾列。
-HEADER = ["市场", "品类", "产地", "规格", "今日价", "前日价", "日涨跌",
+# 「清单名」= 该品类在 medicine_list.txt（971 味）里对应的标准名，对标口径与康美线一致。
+HEADER = ["市场", "品类", "清单名", "产地", "规格", "今日价", "前日价", "日涨跌",
           "较前日", "较月初", "较年初", "单位", "更新时间"]
+
+# 收录口径（2026-11-18 用户明确）：**对标 medicine_list.txt，不按「是不是香料」主观判断**。
+# 和康美线同一套：逐字命中清单就收；再加下面这些「同物异名 / 规格变体」映射到清单写法。
+# 只收「同一个东西换个写法」的；清单里压根没有的（圆香果/长香果/绿豆蔻/葫芦巴）宁可标清单外也不硬并。
+MED_LIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "medicine_list.txt")
+NAME_ALIAS = {
+    "八角": "八角茴香", "益智仁": "益智", "良姜": "高良姜", "荜拨": "荜茇",
+    "沙姜": "山奈", "积壳": "枳壳", "千里香": "九里香", "灵香草": "零陵香",
+    # 规格变体归并（本质是同一味的切片/等级/产形）
+    "干枝八角": "八角茴香", "桂通": "肉桂", "烟桂-8-10公分": "肉桂",
+    "圆壳砂仁": "砂仁", "长壳砂仁": "砂仁",
+    "红花椒": "花椒", "青花椒": "花椒",
+}
+_MED = None
+
+
+def med_names():
+    global _MED
+    if _MED is None:
+        txt = open(MED_LIST_FILE, encoding="utf-8-sig").read()
+        names = []
+        for line in txt.splitlines():
+            n = line.strip()
+            if n and n not in names:
+                names.append(n)
+        _MED = names
+    return _MED
+
+
+def med_map():
+    """中香品类 → 清单标准名（未在清单的返回空串）"""
+    names = set(med_names())
+    m = {n: n for n in names}
+    for zx, std in NAME_ALIAS.items():
+        if std in names:
+            m[zx] = std
+    return m
+
+
+def in_list(name):
+    """给一行报价算清单标准名；不在清单返回 ''"""
+    return med_map().get(name, "")
 
 MARKET = {"china": "国内", "foreign": "国外"}
 FORBIDDEN = "/\\?%*:|\"<>"          # 工作表名里不能出现的字符
@@ -235,7 +285,8 @@ def key_of(r):
 
 
 def to_row(r, stamp):
-    return [r["market"], r["name"], r["producer"], r["spec"] or "统货",
+    return [r["market"], r["name"], in_list(r["name"]),
+            r["producer"], r["spec"] or "统货",
             fnum(r["today"]), fnum(r["lastday"]), fnum(r["amt"], 2),
             fpct(r["dod"]), fpct(r["mom"]), fpct(r["yoy"]),
             r["unit"], stamp]
@@ -294,7 +345,10 @@ def main():
     for r in rows:
         uniq.setdefault(key_of(r), r)
     rows = list(uniq.values())
-    rows.sort(key=lambda r: (r["market"], r["name"], r["producer"], r["spec"]))
+    # 清单内的排前面（同清单名聚在一起），清单外的沉到后面，方便一眼看对照结果
+    rows.sort(key=lambda r: (r["market"], 0 if in_list(r["name"]) else 1,
+                             in_list(r["name"]) or r["name"], r["name"],
+                             r["producer"], r["spec"]))
 
     with open(CSV_OUT, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
@@ -302,6 +356,13 @@ def main():
         for r in rows:
             w.writerow(to_row(r, stamp))
     log("写入 %s（%d 行）" % (os.path.basename(CSV_OUT), len(rows)))
+
+    # 清单对照统计（对标 medicine_list，口径同康美线）
+    in_rows = sum(1 for r in rows if in_list(r["name"]))
+    in_cats = sorted(set(in_list(r["name"]) for r in rows if in_list(r["name"])))
+    out_cats = sorted(set(r["name"] for r in rows if not in_list(r["name"])))
+    log("对标 medicine_list：清单内 %d 行 / %d 味；清单外品类 %d 个（%s）"
+        % (in_rows, len(in_cats), len(out_cats), "、".join(out_cats)))
 
     # 涨跌面统计，日志里给一眼能看懂的结论
     def pv(v):

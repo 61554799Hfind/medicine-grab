@@ -4,6 +4,8 @@ name: 每日中香网香料价格
 #   中香网「香料行情」https://www.zhongxiangwang.cn/latest-price
 #   接口 /api/front/skuChangePrice/getSkuPriceExcelList（AES+RSA 加密，和求购线同一套）
 #   全站 135 行 = 国内 50 品类/120 行 + 国外 4 品类/15 行，粒度是「品类 + 产地 + 规格」。
+#   收录口径对标 medicine_list.txt（971 味）：逐字命中 + 同物异名/规格变体映射，
+#   明细表加「清单名」列标出对应关系；中香网清单内 131 行 / 41 味，清单外 4 品类照留。
 #   中香网对境外开放（求购线一直在 runner 上抓），所以这条线不需要阿里云，直接在 runner 上抓。
 #
 # 什么时候跑
@@ -135,7 +137,7 @@ jobs:
           sheets.sort(key=lambda x: x["index"] or 0)
           out = {"sheets": sheets}
           cn = sh.worksheet("国内香料价格")
-          out["price_head"] = cn.get_values("A1:L3")
+          out["price_head"] = cn.get_values("A1:M3")
           out["cn_rows"] = len(cn.get_all_values()) - 1
           try:
               xx = sh.worksheet("国外香料价格")
