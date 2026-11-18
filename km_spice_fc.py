@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 r"""
-康美香料价格 —— 阿里云函数计算 FC 专用入口（零第三方依赖）
+康美药材价格 —— 阿里云函数计算 FC 专用入口（零第三方依赖）
 
 为什么单独一个函数：
-    香料价格在 www.kmzyw.com.cn（康美中药网）上，这个域名和康美供求那个 kmb2b.com 一样，
+    价格数据在 www.kmzyw.com.cn（康美中药网）上，这个域名和康美供求那个 kmb2b.com 一样，
     对境外 IP 不通 —— GitHub Actions 的海外 runner 三个请求全部 30 秒超时，实测过。
     所以只能在国内出口（阿里云 FC）上抓，抓完把文件提交回 GitHub 仓库，
     再由 GitHub Actions 拿去推 Google 表格。
 
 为什么不并进原来的 km_fc：
     原函数抓「康美需求 + 康美供货 249 页」已经用到 5 分钟上下，
-    香料这一份还要再 2~3 分钟（111 次翻页 + 86 次走势请求），
+    这一份还要再 5 分钟（111 次翻页 + 991 次月价格请求，月价格是 6 并发抓的），
     并在一起会撞 600 秒执行超时上限，一超时两边都拿不到数据。
-    分成两个函数互不影响：香料挂了不影响供货，供货挂了也不影响香料。
+    分成两个函数互不影响：价格挂了不影响供货，供货挂了也不影响价格。
 
 环境变量（FC 控制台 → 函数配置 → 环境变量）：
     GH_TOKEN   GitHub 细粒度 token，权限：该仓库 Contents = Read and write
@@ -20,10 +20,12 @@ r"""
     GH_BRANCH  分支，默认 main
     DRY_RUN    设 1 只抓不提交
     MAX_PAGES  只翻前 N 页（测试用，正常别设）
+    WORKERS    月价格并发数，默认 6（实测 6 并发跑完约 3 分半）
 
 产出（提交回仓库，供 spice-daily.yml 推表）：
-    km_spice_price.csv      86 行香料明细（六市场价 + 周月季年涨跌 + 历史价格列 + 更新时间）
-    km_spice_hist.json.gz   86 味的逐日走势（近一年）+ 月价格（35 个月），压缩后约 150KB
+    km_spice_price.csv      991 行明细（medicine_list.txt 对照康美报价，
+                            六市场价 + 周月季年涨跌 + 历史价格列 + 更新时间）
+    km_spice_hist.json.gz   991 味的月价格（约 35 个月），压缩后约 95KB
 
 本地测试：
     python km_spice_fc.py --dry-run
@@ -40,7 +42,7 @@ import urllib.request
 
 import km_spice
 
-BUILD = "v5-spice 2026-11-18 校验GH_REPO格式"
+BUILD = "v6-spice 2026-11-18 按medicine_list全量991行"
 
 
 class GhError(RuntimeError):
@@ -197,17 +199,19 @@ def first_row():
 def run(dry_run=False):
     max_pages = os.environ.get("MAX_PAGES", "").strip()
     max_pages = int(max_pages) if max_pages.isdigit() else None
+    workers = os.environ.get("WORKERS", "").strip()
+    workers = int(workers) if workers.isdigit() else 6
 
     t0 = time.time()
     try:
-        rows, hist, stats = km_spice.crawl(max_pages=max_pages)
+        rows, hist, stats = km_spice.crawl(max_pages=max_pages, workers=workers)
     except Exception as e:
         raise RuntimeError("抓取康美失败：%s: %s" % (type(e).__name__, e)) from None
     if not rows:
-        return {"ok": False, "msg": "香料 0 行，康美中药网页面结构可能变了"}
+        return {"ok": False, "msg": "药材 0 行，康美中药网页面结构可能变了"}
 
     try:
-        km_spice.write_files(rows, hist, _OUT_CSV, False)   # 只写 CSV，走势自己压 gz
+        km_spice.write_files(rows, hist, _OUT_CSV, False)   # 只写 CSV，月价格自己压 gz
         csv_bytes = open(_OUT_CSV, "rb").read()
         gz_bytes = gzip.compress(
             json.dumps(hist, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 9)
@@ -218,19 +222,20 @@ def run(dry_run=False):
 
     up = sum(1 for r in rows if r["走势"] == "涨")
     down = sum(1 for r in rows if r["走势"] == "跌")
-    msg = ("香料 %d 行（%d 味，周涨 %d / 周跌 %d）；逐日走势 %d 味 / 月价格 %d 味；耗时 %ds"
-           % (stats["spice_rows"], stats["spice_names"], up, down,
-              stats["with_hist"], stats.get("with_month", 0), time.time() - t0))
-    if stats["no_hist"]:
-        msg += "；无走势：" + "、".join(k.split("|")[0] for k in stats["no_hist"][:5])
+    msg = ("药材 %d 行（%d 个品名，对照 medicine_list %d 味；周涨 %d / 周跌 %d）；"
+           "有月价格 %d 味；耗时 %ds"
+           % (stats["herb_rows"], stats["herb_names"], stats["med_list"], up, down,
+              stats.get("with_month", 0), time.time() - t0))
+    if stats.get("no_month"):
+        msg += "；无月价格 %d 味" % len(stats["no_month"])
 
     if dry_run or os.environ.get("DRY_RUN", "").strip() == "1":
         return {"ok": True, "msg": msg + "（演练，未提交）"}
 
     today = time.strftime("%Y-%m-%d")
-    msg += "；" + commit_file(csv_bytes, "康美香料价格自动更新 %s" % today,
+    msg += "；" + commit_file(csv_bytes, "康美药材价格自动更新 %s" % today,
                               "km_spice_price.csv")
-    msg += "；" + commit_file(gz_bytes, "康美香料走势自动更新 %s" % today,
+    msg += "；" + commit_file(gz_bytes, "康美药材月价格自动更新 %s" % today,
                               "km_spice_hist.json.gz")
     return {"ok": True, "msg": msg}
 

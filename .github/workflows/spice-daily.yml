@@ -1,9 +1,10 @@
-name: 每日康美香料价格
+name: 每日康美药材价格
 
 # 数据从哪来
-#   康美香料价格在 www.kmzyw.com.cn 上，这个域名和康美供求那个 kmb2b.com 一样对境外不通，
+#   康美价格行情在 www.kmzyw.com.cn 上，这个域名和康美供求那个 kmb2b.com 一样对境外不通，
 #   海外 runner 三个请求全部 30 秒超时（2026-11-17 实测）。所以抓取跑在阿里云函数上，
 #   函数每早把 km_spice_price.csv / km_spice_hist.json.gz 提交回仓库，这里只负责推 Google 表格。
+#   收录口径 = medicine_list.txt（药通网 971 味）对照康美报价，991 行 / 589 个品名。
 #
 # 什么时候跑
 #   挂在「每日供应商抓取」跑完之后（那个由 Cloudflare 每早 08:05 准点 dispatch）。
@@ -26,7 +27,7 @@ concurrency:
 jobs:
   spice:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     env:
       PYTHONUNBUFFERED: '1'
@@ -81,33 +82,33 @@ jobs:
           TZ: Asia/Shanghai
         run: |
           python - <<'PY'
-          import csv, gzip, json, os, sys, time
+          import csv, gzip, json, os, sys
           from datetime import date
           ok = True
           if not os.path.exists("km_spice_price.csv"):
-              print("::error::仓库里没有 km_spice_price.csv —— 阿里云香料函数没提交成功")
+              print("::error::仓库里没有 km_spice_price.csv —— 阿里云价格函数没提交成功")
               sys.exit(1)
           rows = list(csv.DictReader(open("km_spice_price.csv", encoding="utf-8-sig")))
           def stamp(r):
               return (r.get("更新时间") or r.get("更新日期") or "")[:10]
           days = sorted({stamp(r) for r in rows})
           print(f"明细 {len(rows)} 行，更新时间 {days}")
-          if len(rows) < 20:
-              print(f"::error::香料只有 {len(rows)} 行，明显不对（扩展口径后正常 80 行以上）")
+          if len(rows) < 900:
+              print(f"::error::只有 {len(rows)} 行，明显不对（按 medicine_list 对照正常 990 行左右）"
+                    f"—— 阿里云函数可能还是「只收香料」的旧版（v5 及以前），需要重新部署 km_spice.zip")
               ok = False
           if days and days[-1] != date.today().isoformat():
-              print(f"::warning title=香料数据不是今天::最新是 {days[-1]}，"
+              print(f"::warning title=数据不是今天::最新是 {days[-1]}，"
                     f"今天 {date.today()} —— 阿里云函数可能没跑成功，表里会沿用上一份")
           if not os.path.exists("km_spice_hist.json.gz"):
-              print("::warning title=缺走势数据::没有 km_spice_hist.json.gz，走势页和「历史价格」链接会跳过")
+              print("::warning title=缺月价格数据::没有 km_spice_hist.json.gz，走势页和「历史价格」链接会跳过")
           else:
               with gzip.open("km_spice_hist.json.gz", "rt", encoding="utf-8") as f:
                   h = json.load(f)
               nm = sum(1 for v in h.values() if v.get("monthly"))
-              print(f"走势 {len(h)} 味，其中月价格 {nm} 味")
+              print(f"月价格 {len(h)} 味，其中有数据 {nm} 味")
               if nm < len(h) * 0.8:
-                  print(f"::warning title=月价格偏少::只有 {nm}/{len(h)} 味有月价格，"
-                        f"阿里云函数可能是旧版（没升级到 v3）")
+                  print(f"::warning title=月价格偏少::只有 {nm}/{len(h)} 味有月价格")
           sys.exit(0 if ok else 1)
           PY
 
@@ -127,25 +128,26 @@ jobs:
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import csv, gzip, json, os
-          print("\n### 康美香料\n")
+          print("\n### 康美药材价格（对照 medicine_list.txt）\n")
           rows = []
           if os.path.exists("km_spice_price.csv"):
               rows = list(csv.DictReader(open("km_spice_price.csv", encoding="utf-8-sig")))
               up = sum(1 for r in rows if r.get("走势") == "涨")
               down = sum(1 for r in rows if r.get("走势") == "跌")
+              names = len({r.get("品名") for r in rows})
               print("| 项目 | 数量 |")
               print("|---|---|")
-              print(f"| 香料明细 | {len(rows)} 行 |")
-              print(f"| 本周上涨 | {up} 味 |")
-              print(f"| 本周下跌 | {down} 味 |")
+              print(f"| 明细 | {len(rows)} 行 / {names} 个品名 |")
+              print(f"| 本周上涨 | {up} 行 |")
+              print(f"| 本周下跌 | {down} 行 |")
               d = (rows[0].get("更新时间") or rows[0].get("更新日期") or "?") if rows else "-"
-              print(f"| 数据日期 | {d} |")
+              print(f"| 数据时间 | {d} |")
           if os.path.exists("km_spice_hist.json.gz"):
               with gzip.open("km_spice_hist.json.gz", "rt", encoding="utf-8") as f:
                   h = json.load(f)
-              print(f"| 走势图 | {len(h)} 味 |")
+              print(f"| 有月价格 | {sum(1 for v in h.values() if v.get('monthly'))} 味 |")
           print()
-          print("工作表：香料价格（第一页）/ 香料走势（月价格图 + 历史月均价）")
+          print("工作表：药材价格（第一页）/ 药材走势1…N（每页 80 味，月价格图 + 历史月均价）")
           PY
 
       - name: 回读表格结构（留证据）
@@ -165,10 +167,10 @@ jobs:
               sheets.append({"title": p.get("title"), "index": p.get("index"),
                              "charts": len(s.get("charts") or [])})
           out = {"sheets": sorted(sheets, key=lambda x: x["index"] or 0)}
-          price = sh.worksheet("香料价格")
+          price = sh.worksheet("药材价格")
           out["price_head"] = price.get_values("A1:T3")[:3]
           out["price_rows"] = price.row_count
-          tr = sh.worksheet("香料走势")
+          tr = sh.worksheet("药材走势1")
           out["trend_cols"] = tr.col_count
           out["trend_title"] = tr.get_values("A2:I2")
           out["trend_block1"] = tr.get_values("A20:M26")   # 表标题 + 年/月表头 + 数据行
