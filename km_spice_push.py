@@ -3,15 +3,17 @@ r"""
 把康美香料价格推到 Google 表格（每天全量覆盖）
 
 表格：sheet_id_spice.txt 里那一份（也可以给环境变量 SHEET_ID_SPICE）
-    · 香料价格   —— 明细：品名/规格/产地 + 亳州 安国 成都 玉林 廉桥 普宁 六市场价
-                    + 最高/最低/均价 + 周月季年涨跌 + 走势 + 更新时间（带时分）
-                    涨跌榜末列、走势页顶部也带同一个更新时间
-    · 香料涨跌榜 —— 同一批数据按「周涨跌」从大到小排，一眼看出谁在涨谁在跌
-    · 香料走势   —— 每味一张折线图（近一年逐日价）+ 月度均价小表，对应药通网那种走势图
+    · 香料价格 —— 第一页。明细：品名/规格/产地 + 亳州 安国 成都 玉林 廉桥 普宁 六市场价
+                  + 最高/最低/均价 + 周月季年涨跌 + 走势 + 历史价格(跳转) + 更新时间
+    · 香料走势 —— 每味一块，照康美官网那一版排版：
+                  ① 标题「月价格走势图：品名（规格/产地）」+ 右上「最新月价格：xx 元/千克」
+                  ② 月价格折线图（横轴月份，纵轴元/千克）
+                  ③ 「历史月均价：品名（规格/产地）」年 × 月 矩阵表（十二列，空格写 —）
+                  「香料价格」里的「历史价格」列就跳到对应这一块。
 
 数据来源：km_spice.py（跑在阿里云函数上抓 kmzyw.com.cn，抓完提交 CSV/JSON 回仓库）
     km_spice_price.csv   明细
-    km_spice_hist.json   走势
+    km_spice_hist.json.gz 走势 + 月价格
 
 设计要点（沿用三条线已验证的规矩）
 ------------------------------------------------------------------
@@ -37,7 +39,7 @@ import time
 import gspread
 from gspread.exceptions import APIError
 
-from km_spice import MARKETS, PRICE_HEADER
+from km_spice import MARKETS, PRICE_HEADER          # noqa: F401
 from supplier_push import BATCH, connect, ensure_sheet, log
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,20 +48,24 @@ JSON_HIST = os.path.join(BASE_DIR, "km_spice_hist.json")
 SHEET_ID_FILE = os.path.join(BASE_DIR, "sheet_id_spice.txt")
 
 TAB_PRICE = "香料价格"
-TAB_RANK = "香料涨跌榜"
 TAB_TREND = "香料走势"
 TAB_POOL = "走势数据"
-
-RANK_HEADER = ["品名", "规格", "产地", "现价", "周涨跌", "月涨跌", "季涨跌", "年涨跌", "走势"]
-CHANGE_COLS = ["周涨跌", "月涨跌", "季涨跌", "年涨跌"]
+TAB_OLD_RANK = "香料涨跌榜"      # 旧版有这一页，现在不要了，跑的时候顺手删掉
 
 # 明细表里的「历史价格」列：跟药通网一样放一个链接，点开就是这味的月价格曲线
 LINK_COL = "历史价格"
 LINK_TEXT = "点击查看"
 
-# 走势页：每味一块。A:B 放月度均价小表，图贴在 C 列，块高 16 行
-BLOCK_H = 16
-CHART_W, CHART_H = 900, 280
+MONTH_NAMES = ["一月", "二月", "三月", "四月", "五月", "六月",
+               "七月", "八月", "九月", "十月", "十一月", "十二月"]
+
+# 走势页每味一块的排版（相对块首行的偏移，0-based）
+CHART_OFF = 1          # 图贴在第 2 行
+TABLE_TITLE_OFF = 18   # 「历史月均价：…」
+TABLE_HEAD_OFF = 19    # 年/月 + 一月…十二月
+DATA_OFF = 20          # 数据从这一行开始
+CHART_W, CHART_H = 980, 300
+MAX_YEARS = 8          # 每味最多列 8 个年份（实测 2023~2026 四年）
 
 WIDTHS = {"品名": 110, "规格": 120, "产地": 90, "更新时间": 145, "更新日期": 100,
           "历史价格": 105, "六市场均价": 110, "最高价": 90, "最低价": 90, "现价": 90}
@@ -88,21 +94,6 @@ def require_sheet_id():
     return sid
 
 
-def arrow(p):
-    """涨跌 → 带箭头文字：+3.2% → ▲ 3.20%，-1.8% → ▼ 1.80%，0 → 持平"""
-    if p is None or p == "":
-        return ""
-    try:
-        v = float(p)
-    except (TypeError, ValueError):
-        return str(p)
-    if v > 0:
-        return "▲ %.2f%%" % v
-    if v < 0:
-        return "▼ %.2f%%" % abs(v)
-    return "持平"
-
-
 def load():
     if not os.path.exists(CSV_PRICE):
         raise SystemExit("没找到 %s，先跑 km_spice.py" % CSV_PRICE)
@@ -110,7 +101,7 @@ def load():
         rd = csv.reader(f)
         header = next(rd, None) or []
         rows = [r for r in rd if r and any(c.strip() for c in r)]
-    # 走势：仓库里存的是 gz（阿里云函数提交，约 39KB），本机跑时是 .json
+    # 走势：仓库里存的是 gz（阿里云函数提交），本机跑时可能是 .json
     hist = {}
     if os.path.exists(JSON_HIST + ".gz"):
         with gzip.open(JSON_HIST + ".gz", "rt", encoding="utf-8") as f:
@@ -139,16 +130,12 @@ def months_of(rec):
     return monthly(rec.get("series") or [])
 
 
-def stat_line(series):
-    """标题后面那句：区间 / 最新 / 一年高 / 一年低 / 涨跌幅"""
-    if not series:
-        return ""
-    prices = [p for _, p in series]
-    hi, lo = max(prices), min(prices)
-    last, first = series[-1][1], series[0][1]
-    chg = (last - first) / first * 100 if first else 0
-    return ("%s ~ %s ｜ 最新 %.2f ｜ 一年最高 %.2f ｜ 一年最低 %.2f ｜ 区间 %+.1f%%"
-            % (series[0][0], series[-1][0], last, hi, lo, chg))
+def year_matrix(months):
+    """[(YYYY-MM, 价)] → {(年, 月): 价}，给「历史月均价」矩阵表用"""
+    d = {}
+    for m, p in months:
+        d[(int(m[:4]), int(m[5:7]))] = p
+    return d
 
 
 def sheet_or_none(sh, title):
@@ -156,6 +143,15 @@ def sheet_or_none(sh, title):
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         return None
+
+
+def col_letter(n):
+    """1 → A，3 → C，27 → AA"""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 def write_table(sh, title, header, rows, widths=True):
@@ -198,17 +194,16 @@ def write_table(sh, title, header, rows, widths=True):
 def write_pool(sh, items):
     """隐藏表「走势数据」：每味一段 [月份, 月价格]，返回每段的 0-based 行范围
 
-    用「月价格」而不是逐日点：一是和网页上月价格曲线一致，
-    二是列少（35 vs 364），83 味合计 3 千行左右，建图更快、也不容易撞单元格上限。
+    每段的表头第二格写成「品名（规格/产地）」，这样图上的图例就是这味药的名字。
     """
-    blocks = [(key, rec) for key, rec in items]
-    total = sum(1 + len(months_of(r)) for _, r in blocks) + 20
+    total = sum(1 + len(months_of(rec)) for _, rec in items) + 20
     ws = ensure_sheet(sh, TAB_POOL, total, 2)
     ws.clear()
     buf, spans = [], []
-    for key, rec in blocks:
+    for key, rec in items:
+        name = key.replace("|", "  ")
         start = len(buf)
-        buf.append(["月份", "月价格(元/千克)"])
+        buf.append(["月份", name])
         for m, p in months_of(rec):
             buf.append([m, p])
         spans.append((key, start, len(buf)))       # endRowIndex 是开区间
@@ -220,17 +215,16 @@ def write_pool(sh, items):
     return ws, spans
 
 
-def chart_req(chart_id, title, pool_id, r0, r1):
-    """一张月价格折线图，数据源是指定那一味的月价格段"""
+def chart_req(pool_id, trend_id, r0, r1, anchor_row):
+    """一张月价格折线图：数据源是隐藏表里那一味的月价格段，贴在走势页对应块"""
     return {"addChart": {"chart": {
-        "chartId": chart_id,
         "spec": {
-            "title": title,
+            "title": "",
             # 数据源表是隐藏的，必须显式声明读隐藏行列，否则图出来是空的
             "hiddenDimensionStrategy": "SHOW_ALL",
             "basicChart": {
                 "chartType": "LINE",
-                "legendPosition": "NO_LEGEND",
+                "legendPosition": "TOP",
                 "axis": [{"position": "BOTTOM_AXIS", "title": "月份"},
                          {"position": "LEFT_AXIS", "title": "元/千克"}],
                 "domains": [{"domain": {"sourceRange": {"sources": [{
@@ -243,72 +237,120 @@ def chart_req(chart_id, title, pool_id, r0, r1):
                 "headerCount": 1,
             },
         },
-        # 图不贴在走势页上（那页放不下 80+ 张），只作为「历史价格」列的跳转目标
         "position": {"overlayPosition": {
-            "anchorCell": {"sheetId": pool_id, "rowIndex": 0, "columnIndex": 0},
+            "anchorCell": {"sheetId": trend_id, "rowIndex": anchor_row, "columnIndex": 0},
             "widthPixels": CHART_W, "heightPixels": CHART_H}},
     }}}
 
 
-CHART_SHEET = "香料价格图"
-
-
 def write_trend(sh, items, stamp):
-    """走势页：顶部一行数据更新时间，之后每味一个区块（标题 + 月价格表 + 折线图）
+    """走势页：每味一块 = 标题 + 最新月价 + 折线图 + 年×月历史月均价表
 
-    这一页同时充当「历史价格」的超链接目标：#gid=<本页>&range=C{行}:C{行}
-    所以区块行号必须和「香料价格」每一行的顺序严格对应。
+    版式照康美官网「月价格走势图 + 历史月均价」那一页。
+    这一页同时充当「香料价格」里「历史价格」的超链接目标，所以块的行号必须
+    和明细行顺序严格一致（都按 品名|规格|产地 排序）。
     """
-    ws = ensure_sheet(sh, TAB_TREND, len(items) * BLOCK_H + 40, 12)
+    mats = [(key, rec, year_matrix(months_of(rec))) for key, rec in items]
+    ymax = max([len({y for y, _ in m}) for _, _, m in mats] + [1])
+    ymax = min(ymax, MAX_YEARS)
+    block_h = DATA_OFF + ymax + 1
+    total = 1 + len(mats) * block_h + 5
+
+    ws = ensure_sheet(sh, TAB_TREND, total, 13)
     api(sh.batch_update, {"requests": [{"updateCells": {
         "range": {"sheetId": ws.id}, "fields": "userEnteredFormat"}}]})
     ws.clear()
 
     pool, spans = write_pool(sh, items)
-    span_map = {k: (r0, r1) for k, r0, r1 in spans}
+    span_map = {k: (a, b) for k, a, b in spans}
 
-    area = [["数据更新时间：%s（北京时间） ｜ 数据来源：康美中药网 kmzyw.com.cn ｜ 单位：元/千克"
-             % stamp] + [""] * 11]
-    reqs, anchors = [], []
-    for idx, (key, rec) in enumerate(items):
-        name = key.replace("|", " ")
-        bs = idx * BLOCK_H + 1
-        while len(area) < bs + BLOCK_H:
-            area.append([""] * 12)
-        area[bs][0] = "%s — 月价格走势" % name
-        area[bs][2] = stat_line(rec.get("series") or [])
-        area[bs + 1][0], area[bs + 1][1] = "月份", "月均价"
-        for j, (m, v) in enumerate(months_of(rec), start=2):
-            if bs + j < len(area):
-                area[bs + j][0], area[bs + j][1] = m, v
+    area = [[""] * 13 for _ in range(total)]
+    area[0][0] = ("数据更新时间：%s（北京时间） ｜ 数据来源：康美中药网 kmzyw.com.cn ｜ 单位：元/千克"
+                  % stamp)
+
+    reqs, anchors, bold_rows = [], [], []
+    for idx, (key, rec, mat) in enumerate(mats):
+        name = key.replace("|", "  ")
+        bs = 1 + idx * block_h
+        ms = months_of(rec)
+
+        area[bs][0] = "月价格走势图：%s" % name
+        if ms:
+            area[bs][8] = "最新月价格：%.2f 元/千克" % ms[-1][1]
+        bold_rows.append(bs)
+
+        area[bs + TABLE_TITLE_OFF][0] = "历史月均价：%s" % name
+        bold_rows.append(bs + TABLE_TITLE_OFF)
+
+        head = bs + TABLE_HEAD_OFF
+        area[head][0] = "年/月"
+        for i, mn in enumerate(MONTH_NAMES, start=1):
+            area[head][i] = mn
+        bold_rows.append(head)
+
+        for j, y in enumerate(sorted({y for y, _ in mat})):
+            r = bs + DATA_OFF + j
+            area[r][0] = "%d年" % y
+            for mo in range(1, 13):
+                v = mat.get((y, mo))
+                area[r][mo] = "—" if v is None else round(float(v), 2)
+
         r0, r1 = span_map[key]
-        reqs.append(chart_req(idx + 1, name, pool.id, r0, r1))
-        # 跳转落点：区块标题那一格（1-based 行号 = bs + 1）
-        anchors.append(col_letter(3) + str(bs + 1))     # C 列
+        reqs.append(chart_req(pool.id, ws.id, r0, r1, bs + CHART_OFF))
+        anchors.append("A%d" % (bs + 1))
 
     api(ws.update, area, "A1", value_input_option="RAW")
 
-    # 旧图清理：先查出已有的图表并删掉（每天全量重建）
-    meta = api(sh.fetch_sheet_metadata, {"fields": "sheets(charts(chartId))"})
-    old = [ch["chartId"] for s in meta.get("sheets", [])
-           for ch in (s.get("charts") or [])]
+    # 数字格式：B..M 列一律两位小数（「—」是文本，不受影响）
+    reqs.append({"repeatCell": {
+        "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": total,
+                  "startColumnIndex": 1, "endColumnIndex": 13},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}}},
+        "fields": "userEnteredFormat.numberFormat"}})
+    # 列宽：A 放标题宽一点，B..M 十二个月
+    reqs.append({"updateDimensionProperties": {
+        "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 260}, "fields": "pixelSize"}})
+    reqs.append({"updateDimensionProperties": {
+        "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 13},
+        "properties": {"pixelSize": 78}, "fields": "pixelSize"}})
+    for bs in bold_rows:
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": ws.id, "startRowIndex": bs, "endRowIndex": bs + 1,
+                      "startColumnIndex": 0, "endColumnIndex": 13},
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat"}})
+
+    # 旧图清理：只删这一页上的图（每天全量重建）
+    meta = api(sh.fetch_sheet_metadata, {"fields": "sheets(properties(sheetId),charts(chartId,position))"})
+    old = []
+    for s in meta.get("sheets", []):
+        if s.get("properties", {}).get("sheetId") != ws.id:
+            continue
+        for ch in s.get("charts", []) or []:
+            old.append(ch["chartId"])
     if old:
         api(sh.batch_update, {"requests": [{"deleteEmbeddedObject": {"objectId": cid}}
                                            for cid in old]})
         log("  清掉旧图 %d 张" % len(old))
     for i in range(0, len(reqs), 100):
         api(sh.batch_update, {"requests": reqs[i:i + 100]})
-    log("「%s」%d 味月价格图 + 月度均价表" % (TAB_TREND, len(reqs)))
+    log("「%s」%d 味：月价格图 + 历史月均价表" % (TAB_TREND, len(mats)))
     return ws, anchors
 
 
-def col_letter(n):
-    """1 → A，3 → C，27 → AA"""
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+def reorder(sh, order):
+    """按给定顺序排工作表（第 0 个排最前）"""
+    meta = api(sh.fetch_sheet_metadata, {"fields": "sheets(properties(sheetId,title))"})
+    ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
+    reqs = []
+    for i, name in enumerate(order):
+        if name in ids:
+            reqs.append({"updateSheetProperties": {
+                "properties": {"sheetId": ids[name], "index": i}, "fields": "index"}})
+    if reqs:
+        api(sh.batch_update, {"requests": reqs})
+        log("工作表顺序 → " + " / ".join(n for n in order if n in ids))
 
 
 def main():
@@ -328,20 +370,6 @@ def main():
             (cell(rows[0], "更新日期") if rows else "") or \
             time.strftime("%Y-%m-%d %H:%M")
 
-    # 涨跌榜：按周涨跌从大到小，没有涨跌数据的排最后
-    def wk(r):
-        try:
-            return float(cell(r, "周涨跌") or "")
-        except ValueError:
-            return -999
-    rank = sorted(rows, key=lambda r: (-wk(r), cell(r, "品名")))
-    rank_rows = []
-    for r in rank:
-        line = [cell(r, c) for c in ("品名", "规格", "产地", "现价")]
-        line += [arrow(cell(r, c)) for c in CHANGE_COLS]
-        line.append(cell(r, "走势"))
-        rank_rows.append(line)
-
     # 走势/月价格：按「品名|规格|产地」排序，明细表也按同一顺序写，
     # 这样第 n 味 ↔ 走势页第 n 块，超链接才对得上。
     def key_of(r):
@@ -350,15 +378,20 @@ def main():
     items = sorted(((key_of(r), hist[key_of(r)]) for r in rows if key_of(r) in hist),
                    key=lambda x: x[0])
 
-    log("明细 %d 行 × %d 列；涨跌榜 %d 行；走势 %d 味"
-        % (len(rows), len(header), len(rank_rows), len(items)))
+    def num(r, c):
+        try:
+            return float(cell(r, c))
+        except ValueError:
+            return None
+
+    up = sum(1 for r in rows if (num(r, "周涨跌") or 0) > 0)
+    down = sum(1 for r in rows if (num(r, "周涨跌") or 0) < 0)
+    log("明细 %d 行 × %d 列；走势 %d 味；周涨跌 涨 %d / 跌 %d"
+        % (len(rows), len(header), len(items), up, down))
     if rows:
-        log("样例：%s / %s / %s  周 %s"
+        log("样例：%s / %s / %s  周涨跌 %s"
             % (cell(rows[0], "品名"), cell(rows[0], "规格"),
-               cell(rows[0], "产地"), arrow(cell(rows[0], "周涨跌"))))
-    up = sum(1 for r in rank_rows if r[4].startswith("▲"))
-    down = sum(1 for r in rank_rows if r[4].startswith("▼"))
-    log("周涨跌：涨 %d 味 / 跌 %d 味 / 其余持平或无数据" % (up, down))
+               cell(rows[0], "产地"), cell(rows[0], "周涨跌") or "—"))
 
     if a.dry_run:
         log("--dry-run，不写表")
@@ -388,6 +421,12 @@ def main():
         except Exception as e:
             log("跳过删除「%s」：%s" % (name, e))
 
+    # 旧的「香料涨跌榜」整页删掉（用户 2026-11-18 明确不要这一页）
+    old_rank = sheet_or_none(sh, TAB_OLD_RANK)
+    if old_rank is not None:
+        api(sh.del_worksheet, old_rank)
+        log("删掉旧的「%s」工作表" % TAB_OLD_RANK)
+
     trend_ws, anchors = write_trend(sh, items, stamp)
 
     # 「历史价格」列：放在「更新时间」前一列，每行一个可点的超链接，跳到走势页对应那味
@@ -397,7 +436,7 @@ def main():
         col = header.index(LINK_COL)
         links = []
         for i in range(len(rows)):
-            anchor = anchors[i] if i < len(anchors) else "C1"
+            anchor = anchors[i] if i < len(anchors) else "A1"
             url = ("https://docs.google.com/spreadsheets/d/%s/edit#gid=%d&range=%s"
                    % (sid, trend_ws.id, anchor))
             links.append(['=HYPERLINK("%s","%s")' % (url, LINK_TEXT)])
@@ -407,8 +446,8 @@ def main():
         api(ws_price.update, links, "%s2" % col_letter(col + 1),
             value_input_option="USER_ENTERED")
         log("「%s」写入 %d 个历史价格跳转链接（末列之前）" % (TAB_PRICE, len(links)))
-    write_table(sh, TAB_RANK, RANK_HEADER, rank_rows)
 
+    reorder(sh, [TAB_PRICE, TAB_TREND, TAB_POOL])
     log("全部完成 → https://docs.google.com/spreadsheets/d/%s/edit" % sid)
 
 

@@ -122,16 +122,19 @@ jobs:
           }
 
       - name: 结果自检
+        env:
+          SHEET_ID_SPICE: ${{ secrets.SHEET_ID_SPICE }}
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import csv, gzip, json, os
           print("\n### 康美香料\n")
+          rows = []
           if os.path.exists("km_spice_price.csv"):
               rows = list(csv.DictReader(open("km_spice_price.csv", encoding="utf-8-sig")))
               up = sum(1 for r in rows if r.get("走势") == "涨")
               down = sum(1 for r in rows if r.get("走势") == "跌")
-              print(f"| 项目 | 数量 |")
-              print(f"|---|---|")
+              print("| 项目 | 数量 |")
+              print("|---|---|")
               print(f"| 香料明细 | {len(rows)} 行 |")
               print(f"| 本周上涨 | {up} 味 |")
               print(f"| 本周下跌 | {down} 味 |")
@@ -142,7 +145,37 @@ jobs:
                   h = json.load(f)
               print(f"| 走势图 | {len(h)} 味 |")
           print()
-          print("工作表：香料价格 / 香料涨跌榜 / 香料走势（每味一张折线图 + 月度均价表）")
+          print("工作表：香料价格（第一页）/ 香料走势（月价格图 + 历史月均价）")
+          PY
+
+      - name: 回读表格结构（留证据）
+        env:
+          SHEET_ID_SPICE: ${{ secrets.SHEET_ID_SPICE }}
+        run: |
+          python - <<'PY'
+          import json, os
+          import gspread
+          sh = gspread.service_account(filename="service_account.json").open_by_key(
+              os.environ["SHEET_ID_SPICE"])
+          meta = sh.fetch_sheet_metadata(
+              {"fields": "sheets(properties(sheetId,title,index),charts(chartId))"})
+          sheets = []
+          for s in meta.get("sheets", []):
+              p = s.get("properties", {})
+              sheets.append({"title": p.get("title"), "index": p.get("index"),
+                             "charts": len(s.get("charts") or [])})
+          out = {"sheets": sorted(sheets, key=lambda x: x["index"] or 0)}
+          price = sh.worksheet("香料价格")
+          out["price_head"] = price.get_values("A1:T3")[:3]
+          out["price_rows"] = price.row_count
+          tr = sh.worksheet("香料走势")
+          out["trend_cols"] = tr.col_count
+          out["trend_title"] = tr.get_values("A2:I2")
+          out["trend_block1"] = tr.get_values("A20:M26")   # 表标题 + 年/月表头 + 数据行
+          json.dump(out, open("sheet_check.json", "w", encoding="utf-8"),
+                    ensure_ascii=False, indent=1)
+          print("工作表顺序:", [s["title"] for s in out["sheets"]])
+          print("各页图表数:", [(s["title"], s["charts"]) for s in out["sheets"]])
           PY
 
       - name: 保存结果文件
@@ -154,3 +187,4 @@ jobs:
           path: |
             km_spice_price.csv
             km_spice_hist.json.gz
+            sheet_check.json
