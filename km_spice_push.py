@@ -431,23 +431,26 @@ def main():
     log("打开表格「%s」" % sh.title)
 
     # 删掉新建表格自带的空白 Sheet1（只删确实是空的那种，有数据绝不动）
+    # 注意别把它删成「一个可见工作表都不剩」，Google 会回 400
+    visible = [s["properties"]["title"] for s in
+               api(sh.fetch_sheet_metadata, {"fields": "sheets(properties(title,hidden))"}
+                   ).get("sheets", []) if not s["properties"].get("hidden")]
     for name in ("Sheet1", "工作表1", "Sheet"):
         ws0 = sheet_or_none(sh, name)
-        if ws0 is None:
+        if ws0 is None or len(visible) <= 1:
             continue
         try:
             if not ws0.get_all_values():
                 api(sh.del_worksheet, ws0)
+                if name in visible:
+                    visible.remove(name)
                 log("删掉空白默认工作表「%s」" % name)
         except Exception as e:
             log("跳过删除「%s」：%s" % (name, e))
 
-    # 旧的香料口径页名整页删掉（用户 2026-11-18 明确改成按 medicine_list 全量）
-    for name in OLD_TABS:
-        ws_old = sheet_or_none(sh, name)
-        if ws_old is not None:
-            api(sh.del_worksheet, ws_old)
-            log("删掉旧的「%s」工作表" % name)
+    # 注意：旧页（香料价格/香料走势…）不能先删 —— 如果它是表里唯一可见的工作表，
+    # Google 会回 400「You can't remove all the visible sheets in a document」。
+    # 所以顺序是：先建/写新页 → 最后再删旧页。
 
     anchors = write_trend_pages(sh, items, stamp)
 
@@ -467,6 +470,13 @@ def main():
         api(ws_price.update, links, "%s2" % col_letter(col + 1),
             value_input_option="USER_ENTERED")
         log("「%s」写入 %d 个历史价格跳转链接（末列之前）" % (TAB_PRICE, len(links)))
+
+    # 新页都建好了，这时候删旧的香料口径页才安全
+    for name in OLD_TABS:
+        ws_old = sheet_or_none(sh, name)
+        if ws_old is not None:
+            api(sh.del_worksheet, ws_old)
+            log("删掉旧的「%s」工作表" % name)
 
     reorder(sh, [TAB_PRICE] + ["%s%d" % (TAB_TREND, p + 1) for p in range(pages)] + [TAB_POOL])
     log("全部完成 → https://docs.google.com/spreadsheets/d/%s/edit" % sid)
