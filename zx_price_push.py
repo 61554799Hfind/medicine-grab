@@ -4,24 +4,22 @@ r"""
 
 表格：sheet_id_zxprice.txt（或环境变量 SHEET_ID_ZXPRICE）
 
-版式（2026-11-18 晚，按用户要求：国内/国外拆两张表；走势页做成康美那种「图 + 年×月矩阵」）
+版式（2026-11-18 晚，按用户要求：国内/国外拆两张表；走势页的图和表都改成真实日价格，
+      但整体布局 / 表格排版保持原来康美那套不动）
 
     国内香料价格   —— 120 行：品类/清单名/产地/规格 + 今日价 前日价 日涨跌 较前日 较月初 较年初
                       + 单位 + 历史价格(跳转) + 更新时间
     国外香料价格   —— 15 行，字段同上（清单名 = 该品类在 medicine_list 971 味里对应的标准名，
                       口径同康美线；清单外品类清单名留空）
-    国内香料走势1…N —— 每行一块：月价格折线图 + 「历史月均价」年×月矩阵
+    国内香料走势1…N —— 每味一块：日价格折线图 + 下方「历史日价」明细表
     国外香料走势1…M
     走势数据       —— 隐藏，图的取数区（两个市场共用）
 
-均价怎么来的（中香网没有历史接口，只能自己攒）
+日价数据怎么来的（中香网没有历史接口，只能自己攒）
 ------------------------------------------------------------------
-· 每天抓一次当日价，写进 zx_price_hist.json.gz（键 = 市场|品类|产地|规格）。
-· 月均价 = 该月所有日价的算术平均。所以曲线从 2026-11 开始一月一个点，越跑越长。
-· 为了第一个月图上不是孤零零一个点，补两个**反推锚点**（官方涨跌幅是指标，反推是精确的）：
-      年初价 = 今日价 / (1 + 较年初)  →  放在当年 1 月
-      月初价 = 今日价 / (1 + 较月初)  →  放在当月（当月已有真实日均价时不覆盖）
-  这两个点只在缺月份时补，并在页首说明里注明「反推」。
+· 每天抓一次当日价，写进 zx_price_hist.json.gz（键 = 市场|品类|产地|规格 → {日期: 价格}）。
+· **图和表都用同一份真实日价**：横轴/表格第一列都是日期（2026-11-17 起逐日累积），
+  不加任何反推点 —— 图上、表里的每个价都是中香网当天真实报出的价。
 
 设计要点（与康美线同一套，已验证）
 ------------------------------------------------------------------
@@ -172,6 +170,23 @@ def key_of(name, producer, spec, market):
     return "%s|%s|%s|%s" % (market, name, producer, spec)
 
 
+def days_of(key, hist):
+    """一条报价的逐日真实价：[("2026-11-17", 22.5), ...]，按日期升序。
+
+    只取 zx_price_hist.json.gz 里实际攒下来的日价，不补任何反推点 —— 图上的每个点
+    都必须是中香网当天真实报出的价。
+    """
+    out = []
+    for d, v in (hist.get(key) or {}).items():
+        if not v or len(d) < 10:
+            continue
+        try:
+            out.append((d, round(float(v), 2)))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)
+
+
 def months_of(key, rec, hist):
     """一条报价的逐月均价：日价按月算术平均 + 缺月份用官方涨跌幅反推的锚点
 
@@ -269,23 +284,23 @@ def clear_old_charts(sh):
     return meta
 
 
-def write_pool(sh, items):
-    """隐藏表：每条报价一段 [月份, 月均价]，返回每段 0-based 行范围"""
-    total = sum(1 + len(ms) for _, ms, _, _ in items) + 20
+def write_pool(sh, items, days_map):
+    """隐藏表：每条报价一段 [日期, 真实日价]，返回每段 0-based 行范围"""
+    total = sum(1 + len(days_map.get(k, [])) for k, _, _, _ in items) + 20
     ws = ensure_sheet(sh, TAB_POOL, total, 2)
     api(ws.clear)
     buf, spans = [], []
-    for key, ms, label, _ in items:
+    for key, _ms, label, _rec in items:
         start = len(buf)
-        buf.append(["月份", label])
-        for ym, v in ms:
-            buf.append([ym, v])
+        buf.append(["日期", label])
+        for d, v in days_map.get(key, []):
+            buf.append([d, v])
         spans.append((key, start, len(buf)))
     for i in range(0, len(buf), BATCH):
         api(ws.update, buf[i:i + BATCH], "A%d" % (i + 1), value_input_option="RAW")
     api(sh.batch_update, {"requests": [{"updateSheetProperties": {
         "properties": {"sheetId": ws.id, "hidden": True}, "fields": "hidden"}}]})
-    log("「%s」写入 %d 行月均价数据源（已隐藏）" % (TAB_POOL, len(buf)))
+    log("「%s」写入 %d 行日价格数据源（已隐藏）" % (TAB_POOL, len(buf)))
     return ws, spans
 
 
@@ -297,7 +312,7 @@ def chart_req(pool_id, trend_id, r0, r1, anchor_row, unit):
             "basicChart": {
                 "chartType": "LINE",
                 "legendPosition": "TOP_LEGEND",
-                "axis": [{"position": "BOTTOM_AXIS", "title": "月份"},
+                "axis": [{"position": "BOTTOM_AXIS", "title": "日期"},
                          {"position": "LEFT_AXIS", "title": unit or "价格"}],
                 "domains": [{"domain": {"sourceRange": {"sources": [{
                     "sheetId": pool_id, "startRowIndex": r0, "endRowIndex": r1,
@@ -315,23 +330,22 @@ def chart_req(pool_id, trend_id, r0, r1, anchor_row, unit):
     }}}
 
 
-def block_h(mats):
-    """每块占多少行：标题 + 图 + 「历史月均价」表（年份数决定）"""
-    ymax = max([len({y for y, _ in m}) for _, _, m, _ in mats] + [1])
-    return DATA_OFF + min(ymax, MAX_YEARS) + 1
+def block_h(items, days_map):
+    """每块占多少行：标题 + 图 + 「历史日价」表（按本页最长的日价序列留行）"""
+    nmax = max([len(days_map.get(k, [])) for k, _, _, _ in items] + [1])
+    return DATA_OFF + nmax + 1
 
 
-def write_trend(sh, pool_id, span_map, items, stamp, prefix, market):
-    """一个市场的走势页，每块 = 标题 + 月价格折线图 + 年×月 月均价矩阵（照康美线排版）"""
-    mats = [(key, rec, year_matrix(ms), ms) for key, ms, label, rec in items]
+def write_trend(sh, pool_id, span_map, items, stamp, prefix, market, days_map):
+    """一个市场的走势页：图 = 日价格折线；表 = 历史日价明细，版式沿用康美那套"""
     labels = {key: label for key, _, label, _ in items}
-    bh = block_h(mats)
+    bh = block_h(items, days_map)
     pages = max(1, (len(items) + PER_PAGE - 1) // PER_PAGE)
     anchors, charts = {}, 0
 
     for p in range(pages):
         title = "%s%d" % (prefix, p + 1)
-        chunk = mats[p * PER_PAGE:(p + 1) * PER_PAGE]
+        chunk = items[p * PER_PAGE:(p + 1) * PER_PAGE]
         total = 1 + len(chunk) * bh + 5
         ws = ensure_sheet(sh, title, total, COLS_TREND)
         api(sh.batch_update, {"requests": [{"updateCells": {
@@ -340,39 +354,36 @@ def write_trend(sh, pool_id, span_map, items, stamp, prefix, market):
 
         area = [[""] * COLS_TREND for _ in range(total)]
         area[0][0] = ("数据更新时间：%s ｜ 数据来源：中香网 zhongxiangwang.cn ｜ %s市场 ｜ "
-                      "月均价 = 当月日价平均（2026-11 起累积，首月含按官方涨跌幅反推的年初/月初价）"
+                      "图和表均为每日真实报价（2026-11-17 起逐日累积，无反推值）"
                       " ｜ 第 %d/%d 页" % (stamp, market, p + 1, pages))
 
         reqs, bold = [], []
-        for idx, (key, rec, mat, ms) in enumerate(chunk):
-            label = labels.get(key, key.replace("|", " "))
+        for idx, (key, _ms, label, rec) in enumerate(chunk):
             bs = 1 + idx * bh
+            days = days_map.get(key, [])
 
-            if ms:
-                area[bs][0] = "月价格走势图：%s" % label
-                area[bs][8] = "最新月均价：%.2f %s" % (ms[-1][1], rec["unit"] or "")
+            if days:
+                area[bs][0] = "日价格走势图：%s" % label
+                area[bs][8] = "最新日价：%.2f %s" % (days[-1][1], rec["unit"] or "")
             else:
-                area[bs][0] = "月价格走势图：%s（暂无数据）" % label
+                area[bs][0] = "日价格走势图：%s（暂无数据）" % label
             bold.append(bs)
 
-            area[bs + TABLE_TITLE_OFF][0] = "历史月均价：%s" % label
+            area[bs + TABLE_TITLE_OFF][0] = "历史日价：%s" % label
             bold.append(bs + TABLE_TITLE_OFF)
 
             head = bs + TABLE_HEAD_OFF
-            area[head][0] = "年/月"
-            for i, mn in enumerate(MONTH_NAMES, start=1):
-                area[head][i] = mn
+            area[head][0] = "日期"
+            area[head][1] = "价格（%s）" % (rec["unit"] or "")
             bold.append(head)
 
-            for j, y in enumerate(sorted({y for y, _ in mat})[:MAX_YEARS]):
+            for j, (d, v) in enumerate(days):
                 r = bs + DATA_OFF + j
-                area[r][0] = "%d年" % y
-                for mo in range(1, 13):
-                    v = mat.get((y, mo))
-                    area[r][mo] = "—" if v is None else round(float(v), 2)
+                area[r][0] = d
+                area[r][1] = round(float(v), 2)
 
             r0, r1 = span_map[key]
-            if ms:
+            if days:
                 reqs.append(chart_req(pool_id, ws.id, r0, r1, bs + CHART_OFF, rec["unit"]))
                 charts += 1
             anchors[key] = (ws.id, "A%d" % (bs + 1))
@@ -501,6 +512,11 @@ def main():
         rr.insert(insert_at, "")
         display[market].append(rr)
 
+    # 图和表统一用真实日价；保留 months_of 只为兼容旧调用，走势页不再用反推月均价
+    days_map = {key: days_of(key, hist) for key, _, _, _ in all_items}
+    day_pts = sum(len(v) for v in days_map.values())
+    log("日价格数据源：%d 条报价 / %d 个真实日价点" % (len(days_map), day_pts))
+
     for m, _, _ in MARKETS:
         log("%s：%d 行" % (m, len(grouped[m])))
 
@@ -515,7 +531,7 @@ def main():
             sample = grouped[m][0] if grouped[m] else None
             log("  预览：%s %d 行 → %s %d 页%s" % (
                 tab, len(grouped[m]), prefix, pages,
-                ("；样例 %s 月点=%d" % (sample[2], len(sample[1]))) if sample else ""))
+                ("；样例 %s 日点=%d" % (sample[2], len(days_map.get(sample[0], [])))) if sample else ""))
         log("--dry-run，不写表")
         return
 
@@ -548,13 +564,13 @@ def main():
             log("跳过删除「%s」：%s" % (name, e))
 
     clear_old_charts(sh)
-    pool, spans = write_pool(sh, all_items)
+    pool, spans = write_pool(sh, all_items, days_map)
     span_map = {k: (a0, b0) for k, a0, b0 in spans}
 
     # 先写走势页（拿到 gid 和锚点），再写价格表（「历史价格」列要链过去）
     anchors, trend_order, price_tabs = {}, [], []
     for m, tab_price, tab_trend in MARKETS:
-        a_map, pages = write_trend(sh, pool.id, span_map, grouped[m], stamp, tab_trend, m)
+        a_map, pages = write_trend(sh, pool.id, span_map, grouped[m], stamp, tab_trend, m, days_map)
         anchors.update(a_map)
         trend_order += ["%s%d" % (tab_trend, p + 1) for p in range(pages)]
         price_tabs.append(tab_price)
