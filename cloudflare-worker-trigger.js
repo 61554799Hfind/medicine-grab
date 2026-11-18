@@ -13,8 +13,9 @@
 // （康美必须用阿里云 FC 抓数据，但**推表**这一步还是在 GitHub 上跑，所以它照样要被触发。）
 //
 // ⚠️ 2026-11-18 修的坑：原来按 event.cron 的**原始字符串**查表，Cloudflare 触发器里若写成
-//    "05 0 * * *"（多位前导零）或多余空格，就匹配不上 → 静默走兜底 daily-crawl.yml，
-//    表现就是「不管配了几条，只有药通网那条准时跑」。现在先 normalize 再匹配。
+//    "05 0 * * *"（带前导零）或多余空格，就匹配不上 → 兜底 daily-crawl.yml，
+//    表现就是「不管配了几条，只有药通网那条准时跑」。现在 norm() 先压空格、再去前导零。
+//    v3 起：直接打开 Worker 网址只做自检、不再误触发任何 workflow；要测试必须带 /?wf=xxx。
 //
 // 部署：浏览器里把整段粘到 Cloudflare Workers 的编辑器，点 Deploy。
 // 然后在 Worker「设置 → 触发器 → Cron 触发器」里加下面 ROUTES 里的三条（UTC），表达式必须一模一样。
@@ -22,6 +23,7 @@
 // ============================================================
 
 const REPO = "61554799Hfind/medicine-grab";
+const BUILD = "v3 2026-11-18 去前导零+自检页不误触发";
 
 // 键是 UTC 表达式；注释是北京时间。改时间要同时改这里和 Cloudflare 触发器，两边必须一致。
 const ROUTES = {
@@ -42,8 +44,11 @@ const ALIAS = {
   zx: "zx-price-daily.yml",
 };
 
-// Cloudflare 可能把 "5 0 * * *" 传成 "5 0 * * *" 之外的形式，统一压成单空格再比
-const norm = (s) => String(s || "").trim().split(/\s+/).join(" ");
+// Cloudflare 可能把 "5 0 * * *" 传成 "05 0 * * *" 或多空格，统一压空格 + 去分/时前导零再比
+const norm = (s) => String(s || "").trim().split(/\s+/).map((x, i) => {
+  if (i < 2 && /^0\d$/.test(x)) return String(parseInt(x, 10));  // "05" → "5"
+  return x;
+}).join(" ");
 
 async function dispatch(env, workflow) {
   const url = `https://api.github.com/repos/${REPO}/actions/workflows/${workflow}/dispatches`;
@@ -90,14 +95,17 @@ export default {
   async fetch(request, env, ctx) {
     const u = new URL(request.url);
 
-    if (u.pathname === "/routes") {
+    if (u.pathname === "/routes" || u.pathname === "/") {
       const lines = Object.entries(ROUTES).map(
         ([cron, v]) => `${cron}\t${v.wf}\t${v.label}`
       );
+      const isRoot = u.pathname === "/";
       return new Response(
-        `在 Cloudflare「触发器 → Cron 触发器」里必须有下面这 ${lines.length} 条（UTC，一字不差）：\n\n` +
+        `BUILD: ${BUILD}\n` +
+        (isRoot ? `（本页只是自检，没有触发任何 workflow；要测试请加 /?wf=supplier 等参数）\n` : "") +
+        `\n在 Cloudflare「触发器 → Cron 触发器」里必须有下面这 ${lines.length} 条（UTC，写 05 或 5 都能匹配）：\n\n` +
         lines.join("\n") +
-        `\n\n文件里的 workflow_dispatch 名称：\n` +
+        `\n\n可手动测试的入口：\n` +
         Object.entries(ALIAS).map(([k, v]) => `  /?wf=${k}\t→ ${v}`).join("\n") +
         `\n`,
         { headers: { "content-type": "text/plain; charset=utf-8" } }
