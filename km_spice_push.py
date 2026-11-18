@@ -81,15 +81,38 @@ WIDTHS = {"品名": 110, "规格": 130, "产地": 90, "更新时间": 145, "更�
 
 
 def api(fn, *a, **kw):
-    """429 限速保护：撞了就等 70 秒再试，最多 3 轮。"""
-    for i in range(3):
+    """429 限速保护：撞了就等 65 秒再试，最多 4 轮。"""
+    for i in range(4):
         try:
             return fn(*a, **kw)
         except APIError as e:
-            if "429" not in str(e) or i == 2:
+            if "429" not in str(e) or i == 3:
                 raise
-            log("  ⚠️ 撞到 429 限速，等 70 秒后重试（第 %d 次）" % (i + 1))
-            time.sleep(70)
+            log("  ⚠️ 撞到 429 限速，等 65 秒后重试（第 %d 次）" % (i + 1))
+            time.sleep(65)
+
+
+# 全局限速：Sheets 的读/写配额都是 **每分钟 60 次/用户**，早上几条线共用一个服务账号。
+# 991 行要 13 页 + 隐藏数据页，请求本来就多，不限速一定撞 429（2026-11-18 实测撞过）。
+MIN_GAP = 1.15          # 约 52 次/分钟，留余量
+_LAST = [0.0]
+
+
+def throttle(gc):
+    """给 gspread 的底层 request 套一层节流，所有读写都算一次"""
+    orig = gc.http_client.request
+
+    def wrapper(*a, **kw):
+        gap = MIN_GAP - (time.time() - _LAST[0])
+        if gap > 0:
+            time.sleep(gap)
+        try:
+            return orig(*a, **kw)
+        finally:
+            _LAST[0] = time.time()
+
+    gc.http_client.request = wrapper
+    return gc
 
 
 def require_sheet_id():
@@ -154,7 +177,7 @@ def write_table(sh, title, header, rows, widths=True):
     """一张普通表：unmerge → clear → RAW 覆盖写 → 冻结表头/加粗/筛选器/列宽（无底色）"""
     ws = ensure_sheet(sh, title, len(rows) + 50, len(header))
     api(sh.batch_update, {"requests": [{"unmergeCells": {"range": {"sheetId": ws.id}}}]})
-    ws.clear()
+    api(ws.clear)
     api(ws.update, [header], "A1", value_input_option="RAW")
     n = 0
     for i in range(0, len(rows), BATCH):
@@ -194,7 +217,7 @@ def write_pool(sh, items):
     """
     total = sum(1 + len(months_of(rec)) for _, rec in items) + 20
     ws = ensure_sheet(sh, TAB_POOL, total, 2)
-    ws.clear()
+    api(ws.clear)
     buf, spans = [], []
     for key, rec in items:
         name = key.replace("|", "  ")
@@ -282,7 +305,7 @@ def write_trend_pages(sh, items, stamp):
         ws = ensure_sheet(sh, title, total, COLS_TREND)
         api(sh.batch_update, {"requests": [{"updateCells": {
             "range": {"sheetId": ws.id}, "fields": "userEnteredFormat"}}]})
-        ws.clear()
+        api(ws.clear)
 
         area = [[""] * COLS_TREND for _ in range(total)]
         area[0][0] = ("数据更新时间：%s（北京时间） ｜ 数据来源：康美中药网 kmzyw.com.cn ｜ "
@@ -420,6 +443,7 @@ def main():
         return
 
     gc, sa_email = connect()
+    gc = throttle(gc)
     sid = require_sheet_id()
     try:
         sh = gc.open_by_key(sid)
