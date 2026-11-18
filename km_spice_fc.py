@@ -40,7 +40,7 @@ import urllib.request
 
 import km_spice
 
-BUILD = "v4-spice 2026-11-18 报错带URL+单条容错"
+BUILD = "v5-spice 2026-11-18 校验GH_REPO格式"
 
 
 class GhError(RuntimeError):
@@ -84,13 +84,41 @@ def gh_request(method, url, token, payload=None, timeout=60):
         raise GhError(method, url, e.code, body) from None
 
 
-def commit_file(data, message, path):
-    """把文件提交到仓库（Contents API）。内容没变就跳过，避免每天一个空 commit。"""
-    repo = os.environ.get("GH_REPO", "61554799Hfind/medicine-grab").strip()
-    branch = os.environ.get("GH_BRANCH", "main").strip()
+DEFAULT_REPO = "61554799Hfind/medicine-grab"
+
+
+def gh_conf():
+    """读 GH_REPO / GH_BRANCH / GH_TOKEN 并做格式校验
+
+    踩过的坑：把 token 填进了 GH_REPO，URL 就变成
+    /repos/github_pat_xxxx/contents/... → 一律 404，看起来像「文件不存在 / 没权限」，
+    其实只是变量填错了。所以这里先自己检查一遍，错得明明白白。
+    """
+    repo = (os.environ.get("GH_REPO", "").strip().rstrip("/")
+            or DEFAULT_REPO)
+    branch = os.environ.get("GH_BRANCH", "main").strip() or "main"
     token = os.environ.get("GH_TOKEN", "").strip()
+
+    if repo.startswith(("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")):
+        raise RuntimeError(
+            "GH_REPO 填成 token 了（当前值以 %s 开头）：GH_REPO 要填「用户名/仓库名」= %s，"
+            "token 只放 GH_TOKEN 那一条" % (repo[:14], DEFAULT_REPO))
+    if repo.count("/") != 1 or " " in repo:
+        raise RuntimeError("GH_REPO 格式不对（当前值 = %r）：应为 owner/repo，例如 %s"
+                           % (repo, DEFAULT_REPO))
     if not token:
         raise RuntimeError("没配 GH_TOKEN，无法提交到仓库")
+    if token.startswith("ghp_") or token.startswith("github_pat_"):
+        pass
+    else:
+        raise RuntimeError("GH_TOKEN 看起来不是 GitHub token（应以 ghp_ 或 github_pat_ 开头，"
+                           "当前值前 6 位 = %r）" % token[:6])
+    return repo, branch, token
+
+
+def commit_file(data, message, path):
+    """把文件提交到仓库（Contents API）。内容没变就跳过，避免每天一个空 commit。"""
+    repo, branch, token = gh_conf()
     api = "https://api.github.com/repos/%s/contents/%s" % (repo, path)
     sha, old = None, None
     try:
@@ -114,10 +142,10 @@ def commit_file(data, message, path):
     except GhError as e:
         hint = ""
         if e.code in (403, 404):
-            hint = ("｜GH_TOKEN 对该仓库没有 Contents 读写权限（GitHub 对无权仓库回 404 而不是 403），"
-                    "去 GitHub → Settings → Developer settings → 细粒度 token，"
-                    "确认已选中 %s 且 Contents = Read and write；GH_REPO 当前值 = %s，分支 = %s"
-                    % (repo, repo, branch))
+            hint = ("｜仓库 = %s，分支 = %s。若这个值正确，说明 GH_TOKEN 没有该仓库的 Contents 读写权限"
+                    "（GitHub 对无权仓库回 404 而不是 403）：GitHub → Settings → Developer settings → "
+                    "Personal access tokens → 选中该 token → Repository access 勾上 medicine-grab → "
+                    "Permissions → Contents = Read and write" % (repo, branch))
         raise RuntimeError("提交 %s 失败：%s%s" % (path, e, hint)) from None
     return "已提交 %s（HTTP %s，commit %s）" % (
         path, st, str(j.get("commit", {}).get("sha"))[:7])
