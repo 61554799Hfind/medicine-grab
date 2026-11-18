@@ -134,18 +134,23 @@ jobs:
                              "charts": len(s.get("charts") or [])})
           sheets.sort(key=lambda x: x["index"] or 0)
           out = {"sheets": sheets}
-          price = sh.worksheet("香料价格")
-          out["price_head"] = price.get_values("A1:M3")
-          out["price_rows"] = len(price.get_all_values()) - 1
-          tr = sh.worksheet("香料走势1")
+          cn = sh.worksheet("国内香料价格")
+          out["price_head"] = cn.get_values("A1:L3")
+          out["cn_rows"] = len(cn.get_all_values()) - 1
+          try:
+              xx = sh.worksheet("国外香料价格")
+              out["xx_rows"] = len(xx.get_all_values()) - 1
+          except Exception:
+              out["xx_rows"] = -1
+          tr = sh.worksheet("国内香料走势1")
           out["trend_title"] = tr.get_values("A2:D2")
-          out["trend_nodes"] = tr.get_values("A19:D23")
+          out["trend_matrix"] = tr.get_values("A20:M22")
           json.dump(out, open("sheet_check.json", "w", encoding="utf-8"),
                     ensure_ascii=False, indent=1)
           print("工作表顺序:", [(s["title"], s["charts"]) for s in sheets])
-          print("明细行数:", out["price_rows"])
+          print("国内明细行数:", out["cn_rows"], "／ 国外明细行数:", out["xx_rows"])
           print("表头:", out["price_head"][0])
-          print("第一块:", out["trend_title"], out["trend_nodes"])
+          print("第一块:", out["trend_title"], out["trend_matrix"][:2])
           PY
 
       - name: 保存结果文件
