@@ -9,17 +9,14 @@ name: 每日中香网香料价格
 #   中香网对境外开放（求购线一直在 runner 上抓），所以这条线不需要阿里云，直接在 runner 上抓。
 #
 # 什么时候跑
-#   挂在「每日康美药材价格」跑完之后（那条 08:15 起、约 1 小时），
-#   避开上午几条线的 Google 写入配额；当天报价日仍是当天。
-#   schedule 只是兜底（本仓库 cron 长期迟到 5~8 小时，准点靠 Cloudflare 的 dispatch）。
+#   2026-11-18 起改成独立定点：Cloudflare 每早北京 09:50 dispatch（UTC 50 1 * * *）。
+#   排在最后，避开上午康美价格（08:15）和药通网价格（08:45）两条长线的 Google 写入配额。
+#   schedule 只是兜底（本仓库 cron 长期迟到 5~8 小时，准点靠 Cloudflare）。
 
 on:
-  workflow_run:
-    workflows: ["每日康美药材价格"]
-    types: [completed]
   workflow_dispatch:
-  # 兜底：北京 09:50，等康美价格（08:15~09:15）和药通网价格（08:45~09:45）都跑完，
-  # 避免三个 workflow 共用一个服务账号撞「60 次写入/分钟」配额
+  # 兜底：北京 09:50，与 Cloudflare dispatch 同一时刻；
+  # 避免在上午几条线写表高峰（08:15~09:45）共用一个服务账号撞「60 次写入/分钟」配额
   schedule:
     - cron: '50 1 * * *'
 
@@ -34,9 +31,6 @@ jobs:
   zx:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # 上游「每日康美药材价格」失败时不必跟着跑（中香网本身对境外开放，跑也能跑，
-    # 但那天表格写入会挤在一起，跳过更稳；要补跑就手动 dispatch）
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
 
     env:
       PYTHONUNBUFFERED: '1'

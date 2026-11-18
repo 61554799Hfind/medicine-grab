@@ -2,15 +2,15 @@
 // 用途：Cloudflare Workers 定时调用 GitHub Actions 的 workflow_dispatch 接口，
 //       让每天几条抓取线在**早上的准点**跑起来（GitHub 自己的 cron 在本仓库长期迟到 5~8 小时）。
 //
-// 每天的顺序（北京时间）：
-//   08:05 供应商  ──dispatch──▶ supplier-daily.yml
-//                    └─跑完自动接▶ 每日康美药材价格（workflow_run）
-//                                  └─跑完自动接▶ 每日中香网香料价格（workflow_run）
-//   08:35 求购    ──dispatch──▶ purchase-daily.yml
-//   08:45 药材价格 ──dispatch──▶ daily-crawl.yml（约 1 小时，独占配额）
+// 五条线各自定点（北京时间）—— 2026-11-18 起全部改成独立 cron，不再用 workflow_run 接力：
+//   08:05 供应商  ──dispatch──▶ supplier-daily.yml（6~8 分钟）
+//   08:15 康美价格 ──dispatch──▶ spice-daily.yml（阿里云 07:30 已抓完，这里只推表）
+//   08:35 求购    ──dispatch──▶ purchase-daily.yml（1~2 分钟）
+//   08:45 药材价格 ──dispatch──▶ daily-crawl.yml（约 1 小时）
+//   09:50 中香价格 ──dispatch──▶ zx-price-daily.yml（排最后，避开上午几条线的 Google 写入配额）
 //
-// 所以 Worker 只需要打 3 个 dispatch；康美、中香两条靠 GitHub 的 workflow_run 接力，不用单独配 cron。
-// （康美必须用阿里云 FC 抓数据，但**推表**这一步还是在 GitHub 上跑，所以它照样要被触发。）
+// ⚠️ Cloudflare 免费版每个账户最多 5 条 Cron Trigger，正好用完；账户里别的 Worker 别再占 cron。
+// 五条 workflow 都去掉了 workflow_run，各跑各的，不会再「上游跑完才接」。
 //
 // ⚠️ 2026-11-18 修的坑：原来按 event.cron 的**原始字符串**查表，Cloudflare 触发器里若写成
 //    "05 0 * * *"（带前导零）或多余空格，就匹配不上 → 兜底 daily-crawl.yml，
@@ -23,13 +23,15 @@
 // ============================================================
 
 const REPO = "61554799Hfind/medicine-grab";
-const BUILD = "v3 2026-11-18 去前导零+自检页不误触发";
+const BUILD = "v4 2026-11-18 五条线各自定点";
 
 // 键是 UTC 表达式；注释是北京时间。改时间要同时改这里和 Cloudflare 触发器，两边必须一致。
 const ROUTES = {
-  "5 0 * * *":  { wf: "supplier-daily.yml", label: "供应商 药通网+康美+中香（北京 08:05，6~8 分钟）→ 自动接康美、中香" },
+  "5 0 * * *":  { wf: "supplier-daily.yml", label: "供应商 药通网+康美+中香（北京 08:05，6~8 分钟）" },
+  "15 0 * * *": { wf: "spice-daily.yml",    label: "康美药材价格推表（北京 08:15，数据阿里云 07:30 已备好）" },
   "35 0 * * *": { wf: "purchase-daily.yml", label: "个人求购 药通网+中香（北京 08:35，1~2 分钟）" },
-  "45 0 * * *": { wf: "daily-crawl.yml",    label: "药材价格（北京 08:45，约 1 小时）" },
+  "45 0 * * *": { wf: "daily-crawl.yml",    label: "药通网药材价格（北京 08:45，约 1 小时）" },
+  "50 1 * * *": { wf: "zx-price-daily.yml", label: "中香香料价格（北京 09:50，排最后避开 Google 配额）" },
 };
 
 // 匹配不上时的兜底（宁可多跑一次价格线，也不要静默什么都不做）
@@ -85,13 +87,13 @@ export default {
   },
 
   // 浏览器打开 Worker 网址：
-  //   /                 → 配置自检（列出应有触发器 + 触发价格线）
-  //   /routes           → 只看应有触发器清单（不触发任何 workflow）
-  //   /?wf=supplier     → 立即触发供应商线（会连带康美、中香）
+  //   /                 → 配置自检（列出应有 5 条触发器，不触发任何 workflow）
+  //   /routes           → 同上
+  //   /?wf=supplier     → 立即触发供应商线
+  //   /?wf=spice        → 康美价格推表
   //   /?wf=purchase     → 求购线
-  //   /?wf=price        → 药材价格线
-  //   /?wf=spice        → 只跑康美推表
-  //   /?wf=zx           → 只跑中香推表
+  //   /?wf=price        → 药通网药材价格线
+  //   /?wf=zx           → 中香香料价格线
   async fetch(request, env, ctx) {
     const u = new URL(request.url);
 

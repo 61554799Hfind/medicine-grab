@@ -7,15 +7,15 @@ name: 每日康美药材价格
 #   收录口径 = medicine_list.txt（药通网 971 味）对照康美报价，991 行 / 589 个品名。
 #
 # 什么时候跑
-#   挂在「每日供应商抓取」跑完之后（那个由 Cloudflare 每早 08:05 准点 dispatch）。
-#   阿里云函数 07:30 就抓完提交了，08:05 起推表时数据已经是当天的。
-#   这样做的好处：不用再往 Cloudflare 加第 4 条 cron，也不用改 Worker 代码。
+#   2026-11-18 起改成独立定点：Cloudflare 每早北京 08:15 dispatch（UTC 15 0 * * *）。
+#   阿里云函数 07:30 已抓完提交 CSV，08:15 推表时数据是当天的。
+#   schedule 只是兜底（本仓库 cron 长期迟到 5~8 小时，准点靠 Cloudflare）。
+#   推表是覆盖式，同一天多跑一次不会写坏数据。
 
 on:
-  workflow_run:
-    workflows: ["每日供应商抓取"]
-    types: [completed]
   workflow_dispatch:
+  schedule:
+    - cron: '15 0 * * *'
 
 permissions:
   contents: read
