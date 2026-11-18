@@ -88,16 +88,26 @@ jobs:
               print("::error::仓库里没有 km_spice_price.csv —— 阿里云香料函数没提交成功")
               sys.exit(1)
           rows = list(csv.DictReader(open("km_spice_price.csv", encoding="utf-8-sig")))
-          days = sorted({r.get("更新日期", "") for r in rows})
-          print(f"明细 {len(rows)} 行，更新日期 {days}")
+          def stamp(r):
+              return (r.get("更新时间") or r.get("更新日期") or "")[:10]
+          days = sorted({stamp(r) for r in rows})
+          print(f"明细 {len(rows)} 行，更新时间 {days}")
           if len(rows) < 20:
-              print(f"::error::香料只有 {len(rows)} 行，明显不对（正常 40 行以上）")
+              print(f"::error::香料只有 {len(rows)} 行，明显不对（扩展口径后正常 80 行以上）")
               ok = False
           if days and days[-1] != date.today().isoformat():
               print(f"::warning title=香料数据不是今天::最新是 {days[-1]}，"
                     f"今天 {date.today()} —— 阿里云函数可能没跑成功，表里会沿用上一份")
           if not os.path.exists("km_spice_hist.json.gz"):
-              print("::warning title=缺走势数据::没有 km_spice_hist.json.gz，走势页会跳过")
+              print("::warning title=缺走势数据::没有 km_spice_hist.json.gz，走势页和「历史价格」链接会跳过")
+          else:
+              with gzip.open("km_spice_hist.json.gz", "rt", encoding="utf-8") as f:
+                  h = json.load(f)
+              nm = sum(1 for v in h.values() if v.get("monthly"))
+              print(f"走势 {len(h)} 味，其中月价格 {nm} 味")
+              if nm < len(h) * 0.8:
+                  print(f"::warning title=月价格偏少::只有 {nm}/{len(h)} 味有月价格，"
+                        f"阿里云函数可能是旧版（没升级到 v3）")
           sys.exit(0 if ok else 1)
           PY
 
@@ -125,7 +135,7 @@ jobs:
               print(f"| 香料明细 | {len(rows)} 行 |")
               print(f"| 本周上涨 | {up} 味 |")
               print(f"| 本周下跌 | {down} 味 |")
-              d = rows[0].get("更新日期", "?") if rows else "-"
+              d = (rows[0].get("更新时间") or rows[0].get("更新日期") or "?") if rows else "-"
               print(f"| 数据日期 | {d} |")
           if os.path.exists("km_spice_hist.json.gz"):
               with gzip.open("km_spice_hist.json.gz", "rt", encoding="utf-8") as f:
