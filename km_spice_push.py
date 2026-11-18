@@ -269,6 +269,7 @@ def write_trend(sh, items, stamp):
                   % stamp)
 
     reqs, anchors, bold_rows = [], [], []
+    charts_made = 0
     for idx, (key, rec, mat) in enumerate(mats):
         name = key.replace("|", "  ")
         bs = 1 + idx * block_h
@@ -277,6 +278,9 @@ def write_trend(sh, items, stamp):
         area[bs][0] = "月价格走势图：%s" % name
         if ms:
             area[bs][8] = "最新月价格：%.2f 元/千克" % ms[-1][1]
+        else:
+            # 檀香白/檀香黄/沉香含量15 这类进口规格，康美本来就没有月价格曲线
+            area[bs][0] = "月价格走势图：%s（康美暂无月价格数据）" % name
         bold_rows.append(bs)
 
         area[bs + TABLE_TITLE_OFF][0] = "历史月均价：%s" % name
@@ -296,7 +300,9 @@ def write_trend(sh, items, stamp):
                 area[r][mo] = "—" if v is None else round(float(v), 2)
 
         r0, r1 = span_map[key]
-        reqs.append(chart_req(pool.id, ws.id, r0, r1, bs + CHART_OFF))
+        if ms:
+            reqs.append(chart_req(pool.id, ws.id, r0, r1, bs + CHART_OFF))
+            charts_made += 1
         anchors.append("A%d" % (bs + 1))
 
     api(ws.update, area, "A1", value_input_option="RAW")
@@ -321,11 +327,14 @@ def write_trend(sh, items, stamp):
             "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
             "fields": "userEnteredFormat.textFormat"}})
 
-    # 旧图清理：只删这一页上的图（每天全量重建）
-    meta = api(sh.fetch_sheet_metadata, {"fields": "sheets(properties(sheetId),charts(chartId,position))"})
+    # 旧图清理：走势页 + 隐藏数据页上的图都删掉（每天全量重建）
+    # 早期版本把图贴在「走势数据」页上，不清掉会一天天堆图
+    meta = api(sh.fetch_sheet_metadata,
+               {"fields": "sheets(properties(sheetId,title),charts(chartId))"})
+    keep_id = {ws.id, pool.id}
     old = []
     for s in meta.get("sheets", []):
-        if s.get("properties", {}).get("sheetId") != ws.id:
+        if s.get("properties", {}).get("sheetId") not in keep_id:
             continue
         for ch in s.get("charts", []) or []:
             old.append(ch["chartId"])
@@ -335,7 +344,7 @@ def write_trend(sh, items, stamp):
         log("  清掉旧图 %d 张" % len(old))
     for i in range(0, len(reqs), 100):
         api(sh.batch_update, {"requests": reqs[i:i + 100]})
-    log("「%s」%d 味：月价格图 + 历史月均价表" % (TAB_TREND, len(mats)))
+    log("「%s」%d 味：月价格图 %d 张 + 历史月均价表" % (TAB_TREND, len(mats), charts_made))
     return ws, anchors
 
 
