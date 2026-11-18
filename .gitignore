@@ -5,6 +5,7 @@ sheet_id.txt
 sheet_id_supplier.txt
 sheet_id_purchase.txt
 sheet_id_spice.txt
+sheet_id_zxprice.txt
 
 # 浏览器配置（体积大且含个人数据）
 browser_profile/
@@ -43,6 +44,11 @@ purchase_data.json
 km_spice_hist.json
 _km_spice_*.csv
 _km_spice_*.json.gz
+
+# 中香网香料价格（zhongxiangwang.cn，runner 上能直连）—— CI 自己抓，产物要进仓库给下次对比
+!zx_price.csv
+!zx_price_hist.json.gz
+zx_price_hist.json
 
 # 本机部署说明（里面有康美账号密码）和函数代码包 —— 仓库是公开的，绝不提交
 阿里云部署步骤.txt
