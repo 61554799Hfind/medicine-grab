@@ -224,7 +224,7 @@ def chart_req(pool_id, trend_id, r0, r1, anchor_row):
             "hiddenDimensionStrategy": "SHOW_ALL",
             "basicChart": {
                 "chartType": "LINE",
-                "legendPosition": "TOP",
+                "legendPosition": "TOP_LEGEND",
                 "axis": [{"position": "BOTTOM_AXIS", "title": "月份"},
                          {"position": "LEFT_AXIS", "title": "元/千克"}],
                 "domains": [{"domain": {"sourceRange": {"sources": [{
